@@ -221,29 +221,46 @@ void parseAirMavlinkByte(uint8_t c) {
 }
 
 // =================== CORE 0: MAVLINK <-> LORA BRIDGE ===================
+void reinitAirLoRa() {
+  if (LORA_RST != -1) {
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(15);
+    digitalWrite(LORA_RST, HIGH);
+    delay(20);
+  }
+  LoRa.end();
+  SPI.end();
+  delay(5);
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(433E6)) {
+    loraReady = true;
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(250E3);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0x12);
+    LoRa.setTxPower(20);
+  } else {
+    loraReady = false;
+  }
+}
+
 void loraBridgeLoop(void * pvParameters) {
   uint8_t serialBuf[128];
+  unsigned long lastSuccessfulTx = millis();
+  unsigned long lastAirDiagTime = 0;
   
   for(;;) {
-    // 0. Auto-reconnect if Ra-02 was powered on late or reattached
-    if (!loraReady) {
-      static unsigned long lastRetry = 0;
-      if (millis() - lastRetry > 2000) {
-        lastRetry = millis();
-        if (LORA_RST != -1) {
-          digitalWrite(LORA_RST, LOW);
-          delay(10);
-          digitalWrite(LORA_RST, HIGH);
-          delay(10);
-        }
-        if (LoRa.begin(433E6)) {
-          loraReady = true;
-          LoRa.setSpreadingFactor(7);
-          LoRa.setSignalBandwidth(250E3);
-          LoRa.setCodingRate4(5);
-          LoRa.setSyncWord(0x12);
-          LoRa.setTxPower(20);
-        }
+    unsigned long now = millis();
+
+    // 0. Auto-reconnect & Self-Healing Watchdog if LoRa not ready or stalled > 4.5s
+    if (!loraReady || (now - lastSuccessfulTx > 4500)) {
+      static unsigned long lastResetTry = 0;
+      if (now - lastResetTry > 3000) {
+        lastResetTry = now;
+        reinitAirLoRa();
+        if (loraReady) lastSuccessfulTx = now;
       }
       vTaskDelay(50 / portTICK_PERIOD_MS);
       continue;
@@ -261,10 +278,12 @@ void loraBridgeLoop(void * pvParameters) {
         parseAirMavlinkByte(serialBuf[i]);
       }
 
-      LoRa.beginPacket();
-      LoRa.write(serialBuf, toRead);
-      LoRa.endPacket();
-      loraPktCount++;
+      if (LoRa.beginPacket()) {
+        LoRa.write(serialBuf, toRead);
+        LoRa.endPacket(true); // Non-blocking asynchronous transmit (never hangs in infinite while loop!)
+        loraPktCount++;
+        lastSuccessfulTx = millis();
+      }
     }
 
     // 2. Read incoming LoRa packets (Ground Station commands) -> Forward to F405
@@ -277,9 +296,8 @@ void loraBridgeLoop(void * pvParameters) {
 
     // 3. Periodic Diagnostic Heartbeat (Every 1 second)
     // Ensures Ground Station OLED always receives RF signal and FC byte count
-    static unsigned long lastAirDiagTime = 0;
-    if (millis() - lastAirDiagTime >= 1000) {
-      lastAirDiagTime = millis();
+    if (now - lastAirDiagTime >= 1000) {
+      lastAirDiagTime = now;
       AirDiagPacket diag;
       diag.header[0] = 0x24; // '$'
       diag.header[1] = 0x41; // 'A'
@@ -289,10 +307,12 @@ void loraBridgeLoop(void * pvParameters) {
       diag.flags = 1;
       diag.checksum = calcChecksum((const uint8_t*)&diag, sizeof(diag) - 1);
 
-      LoRa.beginPacket();
-      LoRa.write((const uint8_t*)&diag, sizeof(diag));
-      LoRa.endPacket();
-      loraPktCount++;
+      if (LoRa.beginPacket()) {
+        LoRa.write((const uint8_t*)&diag, sizeof(diag));
+        LoRa.endPacket(true); // Non-blocking asynchronous transmit!
+        loraPktCount++;
+        lastSuccessfulTx = millis();
+      }
     }
     
     // Yield to FreeRTOS scheduler to prevent watchdog resets
@@ -434,6 +454,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     </div>
     <div class="telemetry-badges">
       <div class="badge online"><span class="pulse-dot"></span>Stream :81</div>
+      <div class="badge" id="hudResBadge">QVGA 30FPS</div>
       <div class="badge radio" id="loraBadge">LoRa 433 MHz</div>
       <div class="badge" id="fcBadge">FC: 0 B</div>
       <div class="badge" id="modeBadge">DISARMED</div>
@@ -466,14 +487,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           <div class="standby-sub">Video streaming is paused to save drone battery, Wi-Fi bandwidth, and keep camera cool.</div>
           <button class="btn-start-stream" onclick="toggleStream(true)">Start Live Video</button>
         </div>
-        <img id="streamImg" alt="Stream Standby">
+        <img id="streamImg" crossorigin="anonymous" alt="Stream Standby">
       </div>
 
       <div class="hud-bottom-bar">
         <div style="display: flex; gap: 6px; flex-wrap: wrap;">
           <button class="action-btn" id="btnStreamToggle" onclick="toggleStream()">Start Stream</button>
+          <button class="action-btn" id="btnSnapPhoto" onclick="takeInstantPhoto()" style="color:var(--accent);">Snap Photo</button>
           <button class="action-btn" id="btnRecordToggle" onclick="toggleRecord()" style="color:var(--red);">Record</button>
-          <button class="action-btn" onclick="captureSnapshot()">Snapshot</button>
           <button class="action-btn" id="btnQuickRotate" onclick="cycleQuickRotate()">Rot +90°</button>
           <button class="action-btn" id="btnReticle" onclick="toggleReticle()">Reticle</button>
         </div>
@@ -713,18 +734,39 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       sendLiveControl('flash', duty);
     }
 
-    // Resolution Switcher with Dedicated Stream Reconnect
+    // Resolution Switcher with Safe DMA Sensor Rebind
     function setResolution(resVal, resLabel) {
       document.querySelectorAll('.res-btn').forEach(btn => btn.classList.remove('active'));
       const activeBtn = document.getElementById('res' + resVal);
       if (activeBtn) activeBtn.classList.add('active');
 
-      document.getElementById('hudResBadge').innerText = resLabel;
+      const hudBadge = document.getElementById('hudResBadge');
+      if (hudBadge) hudBadge.innerText = resLabel;
       showToast(`SETTING ${resLabel}`);
 
+      const wasStreaming = isStreaming;
+      if (wasStreaming) {
+        streamImg.src = '';
+      }
+
       fetch(`/control?var=framesize&val=${resVal}`)
+        .then(r => r.text())
         .then(() => {
-          if (isStreaming) setTimeout(reconnectStream, 350);
+          showToast(`RES: ${resLabel}`);
+          if (wasStreaming) {
+            setTimeout(() => {
+              streamImg.crossOrigin = "anonymous";
+              streamImg.src = streamUrl + '?t=' + Date.now();
+            }, 300);
+          }
+        })
+        .catch(err => {
+          console.error(err);
+          showToast('RES SWITCH FAILED');
+          if (wasStreaming) {
+            streamImg.crossOrigin = "anonymous";
+            streamImg.src = streamUrl + '?t=' + Date.now();
+          }
         });
     }
 
@@ -752,6 +794,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // Stream Reconnection Helper
     function reconnectStream() {
       if (isStreaming) {
+        streamImg.crossOrigin = "anonymous";
         streamImg.src = streamUrl + '?t=' + Date.now();
         showToast('STREAM RECONNECTED');
       } else {
@@ -759,10 +802,59 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       }
     }
 
-    // High-res Snapshot Downloader
-    function captureSnapshot() {
-      window.open('/capture?t=' + Date.now(), '_blank');
-      showToast('SNAPSHOT CAPTURED');
+    // Instant High-Resolution Photo Capture (No Live Streaming Needed!)
+    function takeInstantPhoto() {
+      const snapBtn = document.getElementById('btnSnapPhoto');
+      if (snapBtn) snapBtn.innerText = 'Snapping...';
+      showToast('CAPTURING PHOTO...');
+
+      // Shutter flash effect
+      const frame = document.getElementById('streamFrame');
+      frame.style.filter = 'brightness(2.2)';
+      setTimeout(() => frame.style.filter = 'brightness(1)', 120);
+
+      fetch('/capture?t=' + Date.now())
+        .then(response => {
+          if (!response.ok) throw new Error('Capture failed');
+          return response.blob();
+        })
+        .then(blob => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          const now = new Date();
+          const pad = n => (n < 10 ? '0' : '') + n;
+          const stamp = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + '_' +
+                        pad(now.getHours()) + '-' + pad(now.getMinutes()) + '-' + pad(now.getSeconds());
+          a.href = url;
+          a.download = 'ufo_photo_' + stamp + '.jpg';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          }, 1200);
+
+          // If stream is NOT running, show preview for 3.5 seconds
+          if (!isStreaming) {
+            streamImg.src = url;
+            streamStandby.classList.add('hidden');
+            setTimeout(() => {
+              if (!isStreaming) {
+                streamStandby.classList.remove('hidden');
+                streamImg.src = '';
+              }
+            }, 3500);
+          }
+
+          if (snapBtn) snapBtn.innerText = 'Snap Photo';
+          const kb = Math.round(blob.size / 1024);
+          showToast('PHOTO SAVED (' + kb + ' KB)');
+        })
+        .catch(err => {
+          console.error(err);
+          if (snapBtn) snapBtn.innerText = 'Snap Photo';
+          showToast('CAPTURE ERROR');
+        });
     }
 
     // Native Fullscreen Toggle
@@ -785,6 +877,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     let recordInterval = null;
     let recordStartTime = 0;
     let isRecording = false;
+    let selectedMime = '';
 
     function formatTimer(ms) {
       const totalSec = Math.floor((ms || (Date.now() - bootTime)) / 1000);
@@ -808,21 +901,40 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         return;
       }
       recordedChunks = [];
-      const w = streamImg.naturalWidth || 320;
-      const h = streamImg.naturalHeight || 240;
+      const w = streamImg.naturalWidth || 640;
+      const h = streamImg.naturalHeight || 480;
       recordCanvas.width = w;
       recordCanvas.height = h;
 
+      // Prime canvas to solid background
+      recordCtx.fillStyle = '#020408';
+      recordCtx.fillRect(0, 0, w, h);
+
       const canvasStream = recordCanvas.captureStream(25);
-      let options = { mimeType: 'video/webm;codecs=vp8' };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm' };
+      
+      const candidateMimes = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+        'video/mp4;codecs=avc1',
+        'video/mp4'
+      ];
+      selectedMime = '';
+      for (let m of candidateMimes) {
+        if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) {
+          selectedMime = m;
+          break;
+        }
       }
 
       try {
+        const options = selectedMime ? { mimeType: selectedMime } : {};
         mediaRecorder = new MediaRecorder(canvasStream, options);
       } catch (e) {
-        showToast('RECORDING NOT SUPPORTED');
+        console.error('MediaRecorder error', e);
+        showToast('RECORDER NOT SUPPORTED');
         return;
       }
 
@@ -831,54 +943,77 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       };
 
       mediaRecorder.onstop = () => {
-        const blob = new Blob(recordedChunks, { type: 'video/webm' });
+        if (recordedChunks.length === 0) {
+          showToast('RECORDING EMPTY');
+          return;
+        }
+        const isMp4 = (selectedMime && selectedMime.includes('mp4'));
+        const ext = isMp4 ? 'mp4' : 'webm';
+        const blob = new Blob(recordedChunks, { type: selectedMime || 'video/webm' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
+        const now = new Date();
+        const pad = n => (n < 10 ? '0' : '') + n;
+        const stamp = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + '_' +
+                      pad(now.getHours()) + '-' + pad(now.getMinutes()) + '-' + pad(now.getSeconds());
         a.href = url;
-        a.download = 'ufo_flight_' + new Date().toISOString().replace(/[:.]/g, '-') + '.webm';
+        a.download = 'ufo_flight_' + stamp + '.' + ext;
         document.body.appendChild(a);
         a.click();
         setTimeout(() => {
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
-        }, 1000);
-        showToast('RECORDING SAVED!');
+        }, 1200);
+        const kb = Math.round(blob.size / 1024);
+        showToast('SAVED ' + kb + ' KB (.' + ext.toUpperCase() + ')');
       };
 
-      mediaRecorder.start(1000);
+      // 250ms timeslice ensures chunks flush continuously to disk
+      mediaRecorder.start(250);
       isRecording = true;
       recordStartTime = Date.now();
 
       // DVR Render Loop: Composites live video + burned-in FPV OSD Telemetry
       recordInterval = setInterval(() => {
-        if (!isRecording || !streamImg.complete || !streamImg.naturalWidth) return;
-        if (recordCanvas.width !== streamImg.naturalWidth) {
-          recordCanvas.width = streamImg.naturalWidth;
-          recordCanvas.height = streamImg.naturalHeight;
-        }
+        if (!isRecording) return;
+        
         const cw = recordCanvas.width;
         const ch = recordCanvas.height;
 
-        recordCtx.drawImage(streamImg, 0, 0, cw, ch);
+        try {
+          if (streamImg.complete && streamImg.naturalWidth > 0) {
+            if (recordCanvas.width !== streamImg.naturalWidth || recordCanvas.height !== streamImg.naturalHeight) {
+              recordCanvas.width = streamImg.naturalWidth;
+              recordCanvas.height = streamImg.naturalHeight;
+            }
+            recordCtx.drawImage(streamImg, 0, 0, recordCanvas.width, recordCanvas.height);
+          } else {
+            recordCtx.fillStyle = '#050810';
+            recordCtx.fillRect(0, 0, cw, ch);
+          }
+        } catch (err) {
+          recordCtx.fillStyle = '#050810';
+          recordCtx.fillRect(0, 0, cw, ch);
+        }
 
         // Burn-in OSD Telemetry
         recordCtx.font = 'bold 12px monospace';
-        recordCtx.fillStyle = 'rgba(2, 6, 23, 0.7)';
-        recordCtx.fillRect(6, 6, 130, 20);
-        recordCtx.fillRect(cw - 126, 6, 120, 20);
-        recordCtx.fillRect(6, ch - 26, 140, 20);
-        recordCtx.fillRect(cw - 136, ch - 26, 130, 20);
+        recordCtx.fillStyle = 'rgba(2, 6, 23, 0.75)';
+        recordCtx.fillRect(6, 6, 136, 22);
+        recordCtx.fillRect(cw - 132, 6, 126, 22);
+        recordCtx.fillRect(6, ch - 28, 146, 22);
+        recordCtx.fillRect(cw - 138, ch - 28, 132, 22);
 
         recordCtx.fillStyle = latestTelem.armed ? '#00ff9d' : '#f59e0b';
-        recordCtx.fillText((latestTelem.armed ? 'ARM ' : 'DISARM ') + (latestTelem.mode || 'STAB'), 10, 20);
+        recordCtx.fillText((latestTelem.armed ? 'ARM ' : 'DISARM ') + (latestTelem.mode || 'STAB'), 10, 21);
 
         recordCtx.fillStyle = '#ffffff';
-        recordCtx.fillText('SAT:' + (latestTelem.sats || 0) + ' ' + formatTimer(), cw - 120, 20);
+        recordCtx.fillText('SAT:' + (latestTelem.sats || 0) + ' ' + formatTimer(), cw - 124, 21);
 
         recordCtx.fillStyle = '#00f0ff';
-        recordCtx.fillText('BAT:' + (latestTelem.batV ? latestTelem.batV.toFixed(1) + 'V' : '--V') + ' (' + (latestTelem.batPct || 0) + '%)', 10, ch - 12);
+        recordCtx.fillText('BAT:' + (latestTelem.batV ? latestTelem.batV.toFixed(1) + 'V' : '--V') + ' (' + (latestTelem.batPct || 0) + '%)', 10, ch - 13);
 
-        recordCtx.fillText('ALT:' + (latestTelem.alt ? latestTelem.alt.toFixed(1) + 'm' : '0m') + ' ' + (latestTelem.spd ? latestTelem.spd.toFixed(0) : '0') + 'kph', cw - 130, ch - 12);
+        recordCtx.fillText('ALT:' + (latestTelem.alt ? latestTelem.alt.toFixed(1) + 'm' : '0m') + ' ' + (latestTelem.spd ? latestTelem.spd.toFixed(0) : '0') + 'kph', cw - 132, ch - 13);
       }, 40);
 
       const recBtn = document.getElementById('btnRecordToggle');
@@ -1026,14 +1161,18 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
-// 3. Single Frame Capture Handler (Port 80)
+// 3. Single Frame Capture Handler (Port 80 - Instant Photo)
 static esp_err_t capture_handler(httpd_req_t *req) {
+  // Flush older buffered frame to guarantee instant current photo
   camera_fb_t * fb = esp_camera_fb_get();
+  if (fb) esp_camera_fb_return(fb);
+
+  fb = esp_camera_fb_get();
   if (!fb) {
     return httpd_resp_send_500(req);
   }
   httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=ufo_photo.jpg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);
@@ -1055,31 +1194,45 @@ static esp_err_t control_handler(httpd_req_t *req) {
         int res = 0;
 
         if (!strcmp(var, "framesize")) {
-          if (s->pixformat == PIXFORMAT_JPEG) {
+          if (s && s->pixformat == PIXFORMAT_JPEG) {
             res = s->set_framesize(s, (framesize_t)val);
             if (res == 0) currentFramesize = val;
           }
         } else if (!strcmp(var, "quality")) {
-          res = s->set_quality(s, val);
-          if (res == 0) currentQuality = val;
+          if (s) {
+            res = s->set_quality(s, val);
+            if (res == 0) currentQuality = val;
+          }
         } else if (!strcmp(var, "contrast")) {
-          res = s->set_contrast(s, val);
-          if (res == 0) currentContrast = val;
+          if (s) {
+            res = s->set_contrast(s, val);
+            if (res == 0) currentContrast = val;
+          }
         } else if (!strcmp(var, "brightness")) {
-          res = s->set_brightness(s, val);
-          if (res == 0) currentBrightness = val;
+          if (s) {
+            res = s->set_brightness(s, val);
+            if (res == 0) currentBrightness = val;
+          }
         } else if (!strcmp(var, "saturation")) {
-          res = s->set_saturation(s, val);
-          if (res == 0) currentSaturation = val;
+          if (s) {
+            res = s->set_saturation(s, val);
+            if (res == 0) currentSaturation = val;
+          }
         } else if (!strcmp(var, "special_effect")) {
-          res = s->set_special_effect(s, val);
-          if (res == 0) currentEffect = val;
+          if (s) {
+            res = s->set_special_effect(s, val);
+            if (res == 0) currentEffect = val;
+          }
         } else if (!strcmp(var, "vflip")) {
-          res = s->set_vflip(s, val);
-          if (res == 0) currentVflip = val;
+          if (s) {
+            res = s->set_vflip(s, val);
+            if (res == 0) currentVflip = val;
+          }
         } else if (!strcmp(var, "hmirror")) {
-          res = s->set_hmirror(s, val);
-          if (res == 0) currentHmirror = val;
+          if (s) {
+            res = s->set_hmirror(s, val);
+            if (res == 0) currentHmirror = val;
+          }
         } else if (!strcmp(var, "flash")) {
           setFlashBrightness(val);
           res = 0;
@@ -1178,38 +1331,33 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   
-  // QVGA (320x240) balances high FPS (~25-30 FPS) and low latency for FPV
-  config.frame_size   = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12; // 10-63 scale (lower is crisper quality)
-  config.fb_count     = 2;
+  // Allocate DMA buffers at maximum resolution in PSRAM so runtime switches (VGA to UXGA) always succeed
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+  } else {
+    config.frame_size   = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count     = 1;
+  }
 
-  esp_camera_init(&config);
+  esp_err_t camErr = esp_camera_init(&config);
+  if (camErr == ESP_OK) {
+    sensor_t * s = esp_camera_sensor_get();
+    if (s) {
+      s->set_framesize(s, FRAMESIZE_QVGA); // Start at QVGA (320x240) for low-latency FPV
+      s->set_quality(s, 12);
+    }
+  }
 
   // 2. Initialize Wi-Fi Soft AP & Dual-Port HTTP Server
   WiFi.softAP(AP_SSID, AP_PASS);
   startCameraServer();
 
-  // 3. Hardware pulse reset for Ra-02 (SX1278)
-  if (LORA_RST != -1) {
-    pinMode(LORA_RST, OUTPUT);
-    digitalWrite(LORA_RST, LOW);
-    delay(10);
-    digitalWrite(LORA_RST, HIGH);
-    delay(10);
-  }
-
-  // Initialize LoRa SPI Bus
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  
-  if (LoRa.begin(433E6)) {
-    loraReady = true;
-    LoRa.setSpreadingFactor(7);           // Fast throughput for MAVLink
-    LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
-    LoRa.setCodingRate4(5);               // 4/5 coding rate
-    LoRa.setSyncWord(0x12);                // Private drone sync word
-    LoRa.setTxPower(20);                   // +20dBm (100mW max RF output)
-  }
+  // 3. Hardware pulse reset and init Ra-02 (SX1278)
+  reinitAirLoRa();
 
   // 4. Pin LoRa bridge to Core 0 so video serving on Core 1 never drops packets
   xTaskCreatePinnedToCore(

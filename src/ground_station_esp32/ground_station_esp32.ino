@@ -446,6 +446,31 @@ void updateOLED() {
   display.display();
 }
 
+// =================== LORA HARDWARE SELF-HEALING REINIT ===================
+bool reinitGroundLoRa() {
+  if (LORA_RST != -1) {
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(15);
+    digitalWrite(LORA_RST, HIGH);
+    delay(20);
+  }
+  LoRa.end();
+  SPI.end();
+  delay(5);
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(433E6)) {
+    LoRa.setSpreadingFactor(7);           // SF7 for fast throughput
+    LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
+    LoRa.setCodingRate4(5);               // 4/5 coding rate
+    LoRa.setSyncWord(0x12);                // Private drone sync word
+    LoRa.setTxPower(20);                   // +20dBm (100mW) output power
+    return true;
+  }
+  return false;
+}
+
 // =================== SETUP ===================
 void setup() {
   Serial.begin(115200);
@@ -475,20 +500,8 @@ void setup() {
   SerialBT.begin("Drone_Telemetry");
   Serial.println("Bluetooth Started! Ready to pair as 'Drone_Telemetry'");
 
-  // 3. Hardware pulse reset for Ra-02 (SX1278) to guarantee clean transceiver state
-  if (LORA_RST != -1) {
-    pinMode(LORA_RST, OUTPUT);
-    digitalWrite(LORA_RST, LOW);
-    delay(10);
-    digitalWrite(LORA_RST, HIGH);
-    delay(10);
-  }
-
-  // Initialize LoRa SPI Bus
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-
-  if (!LoRa.begin(433E6)) {
+  // 3. Hardware pulse reset and configure Ra-02 (SX1278)
+  if (!reinitGroundLoRa()) {
     Serial.println("LoRa initialization failed!");
     if (oledReady) {
       display.clearDisplay();
@@ -498,15 +511,7 @@ void setup() {
       display.println("Check SPI/RST lines");
       display.display();
     }
-    while (1);
   }
-
-  // Matching RF settings with Air Unit
-  LoRa.setSpreadingFactor(7);           // SF7 for fast throughput
-  LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
-  LoRa.setCodingRate4(5);               // 4/5 coding rate
-  LoRa.setSyncWord(0x12);                // Private drone sync word
-  LoRa.setTxPower(20);                   // +20dBm (100mW) output power
 
   updateStationBattery();
   delay(1000);
@@ -514,6 +519,16 @@ void setup() {
 
 // =================== MAIN LOOP ===================
 void loop() {
+  // 0. LoRa Self-Healing Hardware Watchdog
+  // If no LoRa packets have arrived in the last 4.5 seconds, auto-reset the SX1278 transceiver
+  static unsigned long lastGroundRecovery = 0;
+  unsigned long now = millis();
+  unsigned long lastRx = (lastAirPingTime > lastTelemetryTime) ? lastAirPingTime : lastTelemetryTime;
+  if (now > 5000 && (now - lastRx > 4500) && (now - lastGroundRecovery > 4000)) {
+    lastGroundRecovery = now;
+    reinitGroundLoRa();
+  }
+
   // 1. Receive incoming LoRa packets from Drone -> Forward to Phone (BT) + Parse for OLED
   int packetSize = LoRa.parsePacket();
   if (packetSize > 0) {
@@ -551,9 +566,10 @@ void loop() {
       buffer[count++] = SerialBT.read();
     }
     if (count > 0) {
-      LoRa.beginPacket();
-      LoRa.write(buffer, count);
-      LoRa.endPacket();
+      if (LoRa.beginPacket()) {
+        LoRa.write(buffer, count);
+        LoRa.endPacket(true); // Non-blocking transmit so BT never locks up SX1278!
+      }
     }
   }
 
