@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <Update.h>
 #include "esp_http_server.h"
 
 // =================== PIN DEFINITIONS ===================
@@ -539,6 +540,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div class="badge online"><span class="pulse-dot"></span>Stream :81</div>
       <div class="badge" id="hudResBadge">QVGA 30FPS</div>
       <div class="badge radio" id="loraBadge">LoRa 433 MHz</div>
+      <a href="/update" class="badge radio" style="text-decoration:none;cursor:pointer;">OTA Flash</a>
       <div class="badge" id="fcBadge">FC: 0 B</div>
       <div class="badge" id="modeBadge">STABILIZE</div>
       <div class="badge" id="batBadge">--.-V (--%)</div>
@@ -1348,6 +1350,198 @@ static esp_err_t status_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json, strlen(json));
 }
 
+// =================== WIRELESS OTA FIRMWARE FLASH UI ===================
+static const char PROGMEM UPDATE_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Personal UFO | Wireless OTA Firmware Flash</title>
+  <style>
+    :root {
+      --bg: #070a12;
+      --card-bg: rgba(15, 23, 42, 0.85);
+      --card-border: rgba(30, 41, 59, 0.9);
+      --accent: #00f0ff;
+      --accent-glow: rgba(0, 240, 255, 0.35);
+      --green: #00ff9d;
+      --red: #ff3366;
+      --text: #f1f5f9;
+      --text-muted: #8492a6;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; }
+    body { background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 24px; max-width: 480px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; border-bottom: 1px solid var(--card-border); padding-bottom: 12px; }
+    .icon { width: 12px; height: 12px; background: var(--accent); border-radius: 2px; box-shadow: 0 0 10px var(--accent); }
+    h2 { font-size: 16px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; }
+    h2 span { color: var(--accent); }
+    p { font-size: 13px; color: var(--text-muted); line-height: 1.5; margin-bottom: 16px; }
+    .drop-zone { border: 2px dashed var(--card-border); border-radius: 8px; padding: 24px 16px; text-align: center; margin-bottom: 16px; cursor: pointer; transition: 0.2s; }
+    .drop-zone:hover { border-color: var(--accent); background: rgba(0, 240, 255, 0.05); }
+    input[type="file"] { display: none; }
+    .file-name { font-size: 12px; color: var(--accent); margin-top: 8px; font-weight: 600; word-break: break-all; }
+    .btn { width: 100%; padding: 12px; border: none; border-radius: 6px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; cursor: pointer; background: var(--accent); color: #000; box-shadow: 0 0 15px var(--accent-glow); transition: 0.2s; }
+    .btn:hover { background: #38f8ff; box-shadow: 0 0 25px var(--accent); }
+    .btn:disabled { background: #334155; color: #64748b; box-shadow: none; cursor: not-allowed; }
+    .progress-wrap { display: none; margin-top: 16px; }
+    .bar-bg { width: 100%; height: 8px; background: rgba(30, 41, 59, 0.8); border-radius: 4px; overflow: hidden; margin-bottom: 6px; }
+    .bar-fill { width: 0%; height: 100%; background: var(--green); transition: width 0.15s linear; box-shadow: 0 0 10px var(--green); }
+    .progress-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); }
+    .status { margin-top: 12px; font-size: 12px; font-weight: 600; text-align: center; }
+    .back-link { display: block; text-align: center; margin-top: 16px; font-size: 12px; color: var(--text-muted); text-decoration: none; }
+    .back-link:hover { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="icon"></div>
+      <h2>Personal UFO | <span>OTA Flash</span></h2>
+    </div>
+    <p>Wirelessly update the Air Unit firmware over Wi-Fi. Export the <b>.bin</b> file in Arduino IDE (Ctrl+Alt+S) and upload here.</p>
+
+    <div class="drop-zone" onclick="document.getElementById('binFile').click()">
+      <div style="font-size: 24px; margin-bottom: 6px;">&#9881;</div>
+      <div style="font-size: 13px; font-weight: 600;">Click to select firmware (.bin)</div>
+      <div class="file-name" id="fileName">No file selected</div>
+    </div>
+    <input type="file" id="binFile" accept=".bin" onchange="onFileSelected(this)">
+
+    <button id="uploadBtn" class="btn" disabled onclick="startOTA()">Flash Firmware</button>
+
+    <div class="progress-wrap" id="progWrap">
+      <div class="bar-bg"><div class="bar-fill" id="barFill"></div></div>
+      <div class="progress-meta">
+        <span id="progLabel">Flashing flash memory...</span>
+        <span id="progPct">0%</span>
+      </div>
+    </div>
+
+    <div class="status" id="statusText"></div>
+    <a href="/" class="back-link">&larr; Return to Cockpit HUD</a>
+  </div>
+
+  <script>
+    let selectedFile = null;
+    function onFileSelected(input) {
+      if (input.files && input.files[0]) {
+        selectedFile = input.files[0];
+        document.getElementById('fileName').innerText = selectedFile.name + ' (' + Math.round(selectedFile.size / 1024) + ' KB)';
+        document.getElementById('uploadBtn').disabled = false;
+      }
+    }
+
+    function startOTA() {
+      if (!selectedFile) return;
+      const btn = document.getElementById('uploadBtn');
+      const wrap = document.getElementById('progWrap');
+      const bar = document.getElementById('barFill');
+      const pct = document.getElementById('progPct');
+      const status = document.getElementById('statusText');
+
+      btn.disabled = true;
+      wrap.style.display = 'block';
+      status.style.color = '#00f0ff';
+      status.innerText = 'Transferring binary to ESP32-CAM...';
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/update', true);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          bar.style.width = percent + '%';
+          pct.innerText = percent + '%';
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status === 200 && xhr.responseText.includes('SUCCESS')) {
+          bar.style.width = '100%';
+          pct.innerText = '100%';
+          status.style.color = '#00ff9d';
+          status.innerText = 'SUCCESS! Firmware written. Drone rebooting in 5s...';
+          setTimeout(() => { window.location.href = '/'; }, 8000);
+        } else {
+          status.style.color = '#ff3366';
+          status.innerText = 'FLASH FAILED: ' + xhr.responseText;
+          btn.disabled = false;
+        }
+      };
+
+      xhr.onerror = () => {
+        status.style.color = '#ffb703';
+        status.innerText = 'REBOOTING... Connection closed by drone. Reconnecting...';
+        setTimeout(() => { window.location.href = '/'; }, 10000);
+      };
+
+      xhr.send(selectedFile);
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// 6. Wireless OTA Handlers (Port 80)
+static esp_err_t update_get_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, UPDATE_HTML, strlen(UPDATE_HTML));
+}
+
+static esp_err_t update_post_handler(httpd_req_t *req) {
+  char buf[1024];
+  int remaining = req->content_len;
+
+  if (remaining <= 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty firmware file");
+    return ESP_FAIL;
+  }
+
+  // U_FLASH targets the application firmware partition
+  if (!Update.begin(remaining, U_FLASH)) {
+    char errBuf[64];
+    snprintf(errBuf, sizeof(errBuf), "OTA Begin Failed: err %d", Update.getError());
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, errBuf);
+    return ESP_FAIL;
+  }
+
+  while (remaining > 0) {
+    int toRead = (remaining < (int)sizeof(buf)) ? remaining : (int)sizeof(buf);
+    int received = httpd_req_recv(req, buf, toRead);
+    if (received <= 0) {
+      if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+        continue;
+      }
+      Update.abort();
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Stream receive timeout");
+      return ESP_FAIL;
+    }
+
+    if (Update.write((uint8_t*)buf, received) != (size_t)received) {
+      Update.abort();
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write error");
+      return ESP_FAIL;
+    }
+    remaining -= received;
+  }
+
+  if (Update.end(true)) {
+    if (Update.isFinished()) {
+      httpd_resp_sendstr(req, "SUCCESS");
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      ESP.restart();
+      return ESP_OK;
+    }
+  }
+
+  Update.abort();
+  httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Firmware verification failed");
+  return ESP_FAIL;
+}
+
 // Start Dual-Port Web & Stream Architecture
 void startCameraServer() {
   // 1. Port 80 Server: Dedicated to Cockpit UI and Instant Controls
@@ -1355,18 +1549,22 @@ void startCameraServer() {
   config_ui.server_port = 80;
   config_ui.ctrl_port = 32768; // Primary control port
   config_ui.max_uri_handlers = 8;
-  config_ui.stack_size = 4096;
+  config_ui.stack_size = 8192; // 8KB stack for smooth flash writes
 
-  httpd_uri_t index_uri   = { .uri = "/",        .method = HTTP_GET, .handler = index_handler,   .user_ctx = NULL };
-  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
-  httpd_uri_t control_uri = { .uri = "/control", .method = HTTP_GET, .handler = control_handler, .user_ctx = NULL };
-  httpd_uri_t status_uri  = { .uri = "/status",  .method = HTTP_GET, .handler = status_handler,  .user_ctx = NULL };
+  httpd_uri_t index_uri   = { .uri = "/",        .method = HTTP_GET,  .handler = index_handler,       .user_ctx = NULL };
+  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET,  .handler = capture_handler,     .user_ctx = NULL };
+  httpd_uri_t control_uri = { .uri = "/control", .method = HTTP_GET,  .handler = control_handler,     .user_ctx = NULL };
+  httpd_uri_t status_uri  = { .uri = "/status",  .method = HTTP_GET,  .handler = status_handler,      .user_ctx = NULL };
+  httpd_uri_t update_get  = { .uri = "/update",  .method = HTTP_GET,  .handler = update_get_handler,  .user_ctx = NULL };
+  httpd_uri_t update_post = { .uri = "/update",  .method = HTTP_POST, .handler = update_post_handler, .user_ctx = NULL };
 
   if (httpd_start(&camera_httpd, &config_ui) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     httpd_register_uri_handler(camera_httpd, &control_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
+    httpd_register_uri_handler(camera_httpd, &update_get);
+    httpd_register_uri_handler(camera_httpd, &update_post);
   }
 
   // 2. Port 81 Server: Dedicated Exclusively to the MJPEG Stream
