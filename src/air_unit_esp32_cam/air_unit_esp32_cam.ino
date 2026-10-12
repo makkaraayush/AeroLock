@@ -228,9 +228,85 @@ void parseAirMavlinkByte(uint8_t c) {
   }
 }
 
+// =================== HARDWARE-SAFE NON-BLOCKING LORA DRIVER ===================
+static uint8_t readLoRaReg(uint8_t addr) {
+  digitalWrite(LORA_SS, LOW);
+  SPI.beginTransaction(SPISettings(8E6, MSBFIRST, SPI_MODE0));
+  SPI.transfer(addr & 0x7F);
+  uint8_t val = SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(LORA_SS, HIGH);
+  return val;
+}
+
+static void writeLoRaReg(uint8_t addr, uint8_t val) {
+  digitalWrite(LORA_SS, LOW);
+  SPI.beginTransaction(SPISettings(8E6, MSBFIRST, SPI_MODE0));
+  SPI.transfer(addr | 0x80);
+  SPI.transfer(val);
+  SPI.endTransaction();
+  digitalWrite(LORA_SS, HIGH);
+}
+
+void recoverLoRaRadio() {
+  if (LORA_RST != -1) {
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(10);
+    digitalWrite(LORA_RST, HIGH);
+    delay(10);
+  }
+  if (LoRa.begin(433E6)) {
+    loraReady = true;
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(250E3);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0x12);
+    LoRa.setTxPower(17); // +17dBm (50mW) prevents 3.3V rail voltage sag during motor load/RTL
+    LoRa.setOCP(100);    // 100mA overcurrent limit protects ESP32-CAM 3V3 rail
+  } else {
+    loraReady = false;
+  }
+}
+
+bool safeLoRaSend(const uint8_t* data, size_t len, uint32_t timeoutMs = 120) {
+  if (!loraReady || len == 0) return false;
+
+  if (!LoRa.beginPacket()) {
+    recoverLoRaRadio();
+    return false;
+  }
+  LoRa.write(data, len);
+  LoRa.endPacket(true); // Non-blocking async start - NEVER enters infinite while loop!
+
+  unsigned long start = millis();
+  bool txDone = false;
+  while (millis() - start < timeoutMs) {
+    uint8_t flags = readLoRaReg(0x12); // REG_IRQ_FLAGS
+    if (flags & 0x08) { // IRQ_TX_DONE_MASK
+      writeLoRaReg(0x12, 0x08); // Clear TX_DONE flag
+      txDone = true;
+      break;
+    }
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+
+  if (!txDone) {
+    // Radio timed out or PLL brownout occurred during motor load/RTL -> auto-recover
+    recoverLoRaRadio();
+    return false;
+  }
+
+  // Put radio into RX mode immediately
+  LoRa.parsePacket();
+  return true;
+}
+
 // =================== CORE 0: MAVLINK <-> LORA BRIDGE ===================
 void loraBridgeLoop(void * pvParameters) {
-  uint8_t serialBuf[128];
+  static uint8_t stagingBuf[160];
+  static size_t stagingLen = 0;
+  static unsigned long lastStagingTime = 0;
   static unsigned long lastAirDiagTime = 0;
   
   for(;;) {
@@ -239,59 +315,60 @@ void loraBridgeLoop(void * pvParameters) {
       static unsigned long lastRetry = 0;
       if (millis() - lastRetry > 2000) {
         lastRetry = millis();
-        if (LORA_RST != -1) {
-          digitalWrite(LORA_RST, LOW);
-          delay(10);
-          digitalWrite(LORA_RST, HIGH);
-          delay(10);
-        }
-        if (LoRa.begin(433E6)) {
-          loraReady = true;
-          LoRa.setSpreadingFactor(7);
-          LoRa.setSignalBandwidth(250E3);
-          LoRa.setCodingRate4(5);
-          LoRa.setSyncWord(0x12);
-          LoRa.setTxPower(20);
-        }
+        recoverLoRaRadio();
       }
     }
 
     // 1. Read MAVLink bytes from F405 flight controller -> ALWAYS PARSE TELEMETRY UNCONDITIONALLY!
-    size_t bytesAvail = Serial.available();
-    if (bytesAvail > 0) {
-      size_t toRead = (bytesAvail > sizeof(serialBuf)) ? sizeof(serialBuf) : bytesAvail;
-      Serial.readBytes(serialBuf, toRead);
-      fcByteCount += toRead;
-      
-      // Parse telemetry for local Web Cockpit OSD
-      for (size_t i = 0; i < toRead; i++) {
-        parseAirMavlinkByte(serialBuf[i]);
+    while (Serial.available()) {
+      uint8_t b = Serial.read();
+      fcByteCount++;
+      parseAirMavlinkByte(b); // Local Web Cockpit HUD
+      if (stagingLen < sizeof(stagingBuf)) {
+        stagingBuf[stagingLen++] = b;
       }
-
-      // Forward to LoRa if radio is ready
-      if (loraReady) {
-        LoRa.beginPacket();
-        LoRa.write(serialBuf, toRead);
-        LoRa.endPacket();
-        loraPktCount++;
-      }
+      lastStagingTime = millis();
     }
 
-    // 2. Read incoming LoRa packets (Ground Station commands) -> Forward to F405
-    if (loraReady) {
-      int packetSize = LoRa.parsePacket();
-      if (packetSize > 0) {
-        while (LoRa.available()) {
-          Serial.write((uint8_t)LoRa.read());
+    // 2. Transmit coalesced telemetry packet when buffer has target payload or after quiet gap
+    if (stagingLen >= 120 || (stagingLen > 0 && (millis() - lastStagingTime >= 15))) {
+      if (loraReady) {
+        if (safeLoRaSend(stagingBuf, stagingLen)) {
+          loraPktCount++;
+        }
+      }
+      stagingLen = 0;
+
+      // 3. Dedicated Uplink Receive Window (30ms)
+      // Grants Ground Station (QGroundControl) clear airtime to send Waypoints, Missions, & Parameters!
+      unsigned long rxStart = millis();
+      while (millis() - rxStart < 30) {
+        if (loraReady) {
+          int packetSize = LoRa.parsePacket();
+          if (packetSize > 0) {
+            while (LoRa.available()) {
+              Serial.write((uint8_t)LoRa.read());
+            }
+          }
+        }
+        vTaskDelay(2 / portTICK_PERIOD_MS);
+      }
+    } else {
+      // 4. If idle, check for incoming LoRa packets (Ground Station commands)
+      if (loraReady) {
+        int packetSize = LoRa.parsePacket();
+        if (packetSize > 0) {
+          while (LoRa.available()) {
+            Serial.write((uint8_t)LoRa.read());
+          }
         }
       }
     }
 
-    // 3. Periodic Diagnostic Heartbeat (Every 1 second)
-    // Ensures Ground Station OLED always receives RF signal and FC byte count
-    if (millis() - lastAirDiagTime >= 1000) {
+    // 5. Periodic Diagnostic Heartbeat (Every 1.2s) when idle
+    if (millis() - lastAirDiagTime >= 1200) {
       lastAirDiagTime = millis();
-      if (loraReady) {
+      if (loraReady && stagingLen == 0) {
         AirDiagPacket diag;
         diag.header[0] = 0x24; // '$'
         diag.header[1] = 0x41; // 'A'
@@ -301,10 +378,9 @@ void loraBridgeLoop(void * pvParameters) {
         diag.flags = 1;
         diag.checksum = calcChecksum((const uint8_t*)&diag, sizeof(diag) - 1);
 
-        LoRa.beginPacket();
-        LoRa.write((const uint8_t*)&diag, sizeof(diag));
-        LoRa.endPacket();
-        loraPktCount++;
+        if (safeLoRaSend((const uint8_t*)&diag, sizeof(diag))) {
+          loraPktCount++;
+        }
       }
     }
     
@@ -1295,7 +1371,8 @@ void startCameraServer() {
 
 // =================== SETUP ===================
 void setup() {
-  // Serial0 connects to F405 FC UART at 19200 baud
+  // Serial0 connects to F405 FC UART at 19200 baud with 2048-byte RX buffer
+  Serial.setRxBufferSize(2048);
   Serial.begin(19200);
 
   // Initialize Flashlight PWM (GPIO 4)
@@ -1368,7 +1445,8 @@ void setup() {
     LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
     LoRa.setCodingRate4(5);               // 4/5 coding rate
     LoRa.setSyncWord(0x12);                // Private drone sync word
-    LoRa.setTxPower(20);                   // +20dBm (100mW max RF output)
+    LoRa.setTxPower(17);                   // +17dBm (50mW) rock-solid without brownouts
+    LoRa.setOCP(100);                      // 100mA overcurrent limit protects ESP32-CAM 3V3 rail
   }
 
   // 4. Pin LoRa bridge to Core 0 so video serving on Core 1 never drops packets

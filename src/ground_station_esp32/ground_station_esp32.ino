@@ -89,6 +89,75 @@ static uint8_t calcChecksum(const uint8_t* data, size_t len) {
   return cs;
 }
 
+// =================== HARDWARE-SAFE NON-BLOCKING LORA DRIVER ===================
+static uint8_t readLoRaReg(uint8_t addr) {
+  digitalWrite(LORA_SS, LOW);
+  SPI.beginTransaction(SPISettings(8E6, MSBFIRST, SPI_MODE0));
+  SPI.transfer(addr & 0x7F);
+  uint8_t val = SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(LORA_SS, HIGH);
+  return val;
+}
+
+static void writeLoRaReg(uint8_t addr, uint8_t val) {
+  digitalWrite(LORA_SS, LOW);
+  SPI.beginTransaction(SPISettings(8E6, MSBFIRST, SPI_MODE0));
+  SPI.transfer(addr | 0x80);
+  SPI.transfer(val);
+  SPI.endTransaction();
+  digitalWrite(LORA_SS, HIGH);
+}
+
+void recoverLoRaRadio() {
+  if (LORA_RST != -1) {
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(10);
+    digitalWrite(LORA_RST, HIGH);
+    delay(10);
+  }
+  if (LoRa.begin(433E6)) {
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(250E3);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0x12);
+    LoRa.setTxPower(17);
+    LoRa.setOCP(100);
+  }
+}
+
+bool safeLoRaSend(const uint8_t* data, size_t len, uint32_t timeoutMs = 120) {
+  if (len == 0) return false;
+
+  if (!LoRa.beginPacket()) {
+    recoverLoRaRadio();
+    return false;
+  }
+  LoRa.write(data, len);
+  LoRa.endPacket(true);
+
+  unsigned long start = millis();
+  bool txDone = false;
+  while (millis() - start < timeoutMs) {
+    uint8_t flags = readLoRaReg(0x12);
+    if (flags & 0x08) {
+      writeLoRaReg(0x12, 0x08);
+      txDone = true;
+      break;
+    }
+    delay(1);
+  }
+
+  if (!txDone) {
+    recoverLoRaRadio();
+    return false;
+  }
+
+  LoRa.parsePacket();
+  return true;
+}
+
 // =================== LIGHTWEIGHT MAVLINK PARSER ===================
 // Custom zero-overhead MAVLink v1 / v2 state machine parser.
 // Extracts only essential fields without requiring massive external libraries.
@@ -274,13 +343,13 @@ void updateOLED() {
     return;
   }
 
-  // If telemetry link is alive: Run Option B Asymmetric Auto-Carousel (17s total)
+  // If telemetry link is alive: Run Option B Asymmetric Auto-Carousel (20s total)
   if (linkAlive) {
-    // Page 1: 0 to 9999 ms (10.0 seconds) -> Fighter Jet HUD
-    // Page 2: 10000 to 13499 ms (3.5 seconds) -> GPS Retrieval Deck
-    // Page 3: 13500 to 16999 ms (3.5 seconds) -> RF Link Diagnostics
-    unsigned long cycle = millis() % 17000;
-    int page = (cycle < 10000) ? 1 : ((cycle < 13500) ? 2 : 3);
+    // Page 1: 0 to 13999 ms (14.0 seconds) -> Fighter Jet HUD
+    // Page 2: 14000 to 16999 ms (3.0 seconds) -> GPS Retrieval Deck
+    // Page 3: 17000 to 19999 ms (3.0 seconds) -> RF Link Diagnostics
+    unsigned long cycle = millis() % 20000;
+    int page = (cycle < 14000) ? 1 : ((cycle < 17000) ? 2 : 3);
 
     if (page == 1) {
       // ===== PAGE 1: FIGHTER JET HUD (10.0s) =====
@@ -396,6 +465,7 @@ void updateOLED() {
 
   } else {
     // Telemetry not connected: show RF Link & FC UART connection diagnostics
+    display.setTextWrap(false);
     display.setTextSize(1);
     display.setCursor(0, 0);
     if (airRfAlive) {
@@ -460,6 +530,7 @@ void setup() {
 
   // 1. Initialize OLED
   Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(100000); // 100kHz standard mode for high electrical noise immunity
   if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDR_1)) {
     oledReady = true;
   } else if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDR_2)) {
@@ -514,7 +585,8 @@ void setup() {
   LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
   LoRa.setCodingRate4(5);               // 4/5 coding rate
   LoRa.setSyncWord(0x12);                // Private drone sync word
-  LoRa.setTxPower(20);                   // +20dBm (100mW) output power
+  LoRa.setTxPower(17);                   // +17dBm (50mW) output power
+  LoRa.setOCP(100);                      // 100mA overcurrent limit
 
   updateStationBattery();
   delay(1000);
@@ -553,15 +625,19 @@ void loop() {
 
   // 2. Receive commands from Phone (BT) -> Forward to Drone over LoRa
   if (SerialBT.available()) {
-    uint8_t buffer[128];
+    uint8_t buffer[160];
     int count = 0;
-    while (SerialBT.available() && count < sizeof(buffer)) {
-      buffer[count++] = SerialBT.read();
+    unsigned long startRead = millis();
+    while ((millis() - startRead < 12) && count < sizeof(buffer)) {
+      if (SerialBT.available()) {
+        buffer[count++] = SerialBT.read();
+        startRead = millis();
+      } else {
+        delay(1);
+      }
     }
     if (count > 0) {
-      LoRa.beginPacket();
-      LoRa.write(buffer, count);
-      LoRa.endPacket();
+      safeLoRaSend(buffer, count);
     }
   }
 
