@@ -232,6 +232,14 @@ void parseAirMavlinkByte(uint8_t c) {
         else if (msgId == 253) {
           fastFlushRequested = true; // Send mode change notifications instantly to QGC
         }
+        // 6. COMMAND_ACK (Msg #77) - Critical Arm / Disarm / Mode / Takeoff acknowledgment
+        else if (msgId == 77) {
+          fastFlushRequested = true; // Flush COMMAND_ACK immediately so QGC gets confirmation within 100ms!
+        }
+        // 7. Mission negotiation: MISSION_ACK (47), MISSION_REQUEST (40), MISSION_COUNT (44)
+        else if (msgId == 47 || msgId == 40 || msgId == 44) {
+          fastFlushRequested = true; // Fast-forward waypoint mission negotiation
+        }
 
         state = 30;
       }
@@ -354,16 +362,20 @@ void loraBridgeLoop(void * pvParameters) {
       }
       stagingLen = 0;
 
-      // 3. Dedicated Uplink Receive Window (30ms)
-      // Grants Ground Station (QGroundControl) clear airtime to send Waypoints, Missions, & Parameters!
+      // 3. Dedicated Uplink Receive Window (75ms)
+      // Grants Ground Station (QGroundControl) clear airtime to send Arm, Takeoff, Mode, Waypoints, & Parameters!
       unsigned long rxStart = millis();
-      while (millis() - rxStart < 30) {
+      while (millis() - rxStart < 75) {
         if (loraReady) {
           int packetSize = LoRa.parsePacket();
           if (packetSize > 0) {
             while (LoRa.available()) {
               Serial.write((uint8_t)LoRa.read());
             }
+            rxStart = millis(); // Reset timer to allow chained command packets
+          } else if (readLoRaReg(0x18) & 0x08) {
+            // Incoming packet is actively being received over the air -> extend window so it is not cut off!
+            rxStart = millis();
           }
         }
         vTaskDelay(2 / portTICK_PERIOD_MS);

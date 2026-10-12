@@ -643,6 +643,12 @@ void loop() {
       }
     }
     if (count > 0) {
+      // If an incoming downlink packet is currently being received, wait briefly for it to complete
+      // This guarantees transmission fires directly into the Air Unit's open listening window!
+      unsigned long waitStart = millis();
+      while ((readLoRaReg(0x18) & 0x08) && (millis() - waitStart < 40)) {
+        delay(2);
+      }
       safeLoRaSend(buffer, count);
     }
   }
