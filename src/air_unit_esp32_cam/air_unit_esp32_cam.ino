@@ -69,7 +69,7 @@ volatile uint32_t fcByteCount = 0;
 volatile uint32_t loraPktCount = 0;
 
 // Decoded MAVLink Telemetry States (displayed in Web Cockpit OSD)
-char flightMode[14] = "DISARMED";
+char flightMode[16] = "STABILIZE";
 volatile bool droneArmed = false;
 volatile float droneBatVolts = 0.0;
 volatile int droneBatPct = 0;
@@ -182,14 +182,22 @@ void parseAirMavlinkByte(uint8_t c) {
           droneArmed = (buf[6] & 128) != 0;
           switch (customMode) {
             case 0:  strcpy(flightMode, "STABILIZE"); break;
+            case 1:  strcpy(flightMode, "ACRO");      break;
             case 2:  strcpy(flightMode, "ALT_HOLD");  break;
             case 3:  strcpy(flightMode, "AUTO");      break;
+            case 4:  strcpy(flightMode, "GUIDED");    break;
             case 5:  strcpy(flightMode, "LOITER");    break;
             case 6:  strcpy(flightMode, "RTL");       break;
+            case 7:  strcpy(flightMode, "CIRCLE");    break;
             case 9:  strcpy(flightMode, "LAND");      break;
-            case 16: strcpy(flightMode, "POSHOLD");   break;
+            case 11: strcpy(flightMode, "DRIFT");     break;
+            case 13: strcpy(flightMode, "SPORT");     break;
+            case 14: strcpy(flightMode, "FLIP");      break;
             case 15: strcpy(flightMode, "AUTOTUNE");  break;
-            default: strcpy(flightMode, droneArmed ? "ARMED" : "DISARMED"); break;
+            case 16: strcpy(flightMode, "POSHOLD");   break;
+            case 17: strcpy(flightMode, "BRAKE");     break;
+            case 21: strcpy(flightMode, "SMART_RTL"); break;
+            default: strcpy(flightMode, "CUSTOM");    break;
           }
         }
         // 2. SYS_STATUS (Msg #1)
@@ -221,52 +229,34 @@ void parseAirMavlinkByte(uint8_t c) {
 }
 
 // =================== CORE 0: MAVLINK <-> LORA BRIDGE ===================
-void reinitAirLoRa() {
-  if (LORA_RST != -1) {
-    pinMode(LORA_RST, OUTPUT);
-    digitalWrite(LORA_RST, LOW);
-    delay(15);
-    digitalWrite(LORA_RST, HIGH);
-    delay(20);
-  }
-  LoRa.end();
-  SPI.end();
-  delay(5);
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (LoRa.begin(433E6)) {
-    loraReady = true;
-    LoRa.setSpreadingFactor(7);
-    LoRa.setSignalBandwidth(250E3);
-    LoRa.setCodingRate4(5);
-    LoRa.setSyncWord(0x12);
-    LoRa.setTxPower(20);
-  } else {
-    loraReady = false;
-  }
-}
-
 void loraBridgeLoop(void * pvParameters) {
   uint8_t serialBuf[128];
-  unsigned long lastSuccessfulTx = millis();
-  unsigned long lastAirDiagTime = 0;
+  static unsigned long lastAirDiagTime = 0;
   
   for(;;) {
-    unsigned long now = millis();
-
-    // 0. Auto-reconnect & Self-Healing Watchdog if LoRa not ready or stalled > 4.5s
-    if (!loraReady || (now - lastSuccessfulTx > 4500)) {
-      static unsigned long lastResetTry = 0;
-      if (now - lastResetTry > 3000) {
-        lastResetTry = now;
-        reinitAirLoRa();
-        if (loraReady) lastSuccessfulTx = now;
+    // 0. Auto-reconnect if Ra-02 was powered on late or reattached
+    if (!loraReady) {
+      static unsigned long lastRetry = 0;
+      if (millis() - lastRetry > 2000) {
+        lastRetry = millis();
+        if (LORA_RST != -1) {
+          digitalWrite(LORA_RST, LOW);
+          delay(10);
+          digitalWrite(LORA_RST, HIGH);
+          delay(10);
+        }
+        if (LoRa.begin(433E6)) {
+          loraReady = true;
+          LoRa.setSpreadingFactor(7);
+          LoRa.setSignalBandwidth(250E3);
+          LoRa.setCodingRate4(5);
+          LoRa.setSyncWord(0x12);
+          LoRa.setTxPower(20);
+        }
       }
-      vTaskDelay(50 / portTICK_PERIOD_MS);
-      continue;
     }
 
-    // 1. Read MAVLink bytes from F405 flight controller -> Transmit over LoRa
+    // 1. Read MAVLink bytes from F405 flight controller -> ALWAYS PARSE TELEMETRY UNCONDITIONALLY!
     size_t bytesAvail = Serial.available();
     if (bytesAvail > 0) {
       size_t toRead = (bytesAvail > sizeof(serialBuf)) ? sizeof(serialBuf) : bytesAvail;
@@ -278,40 +268,43 @@ void loraBridgeLoop(void * pvParameters) {
         parseAirMavlinkByte(serialBuf[i]);
       }
 
-      if (LoRa.beginPacket()) {
+      // Forward to LoRa if radio is ready
+      if (loraReady) {
+        LoRa.beginPacket();
         LoRa.write(serialBuf, toRead);
-        LoRa.endPacket(true); // Non-blocking asynchronous transmit (never hangs in infinite while loop!)
+        LoRa.endPacket();
         loraPktCount++;
-        lastSuccessfulTx = millis();
       }
     }
 
     // 2. Read incoming LoRa packets (Ground Station commands) -> Forward to F405
-    int packetSize = LoRa.parsePacket();
-    if (packetSize > 0) {
-      while (LoRa.available()) {
-        Serial.write((uint8_t)LoRa.read());
+    if (loraReady) {
+      int packetSize = LoRa.parsePacket();
+      if (packetSize > 0) {
+        while (LoRa.available()) {
+          Serial.write((uint8_t)LoRa.read());
+        }
       }
     }
 
     // 3. Periodic Diagnostic Heartbeat (Every 1 second)
     // Ensures Ground Station OLED always receives RF signal and FC byte count
-    if (now - lastAirDiagTime >= 1000) {
-      lastAirDiagTime = now;
-      AirDiagPacket diag;
-      diag.header[0] = 0x24; // '$'
-      diag.header[1] = 0x41; // 'A'
-      diag.header[2] = 0x47; // 'G'
-      diag.fcByteCount = fcByteCount;
-      diag.loraPktCount = loraPktCount;
-      diag.flags = 1;
-      diag.checksum = calcChecksum((const uint8_t*)&diag, sizeof(diag) - 1);
+    if (millis() - lastAirDiagTime >= 1000) {
+      lastAirDiagTime = millis();
+      if (loraReady) {
+        AirDiagPacket diag;
+        diag.header[0] = 0x24; // '$'
+        diag.header[1] = 0x41; // 'A'
+        diag.header[2] = 0x47; // 'G'
+        diag.fcByteCount = fcByteCount;
+        diag.loraPktCount = loraPktCount;
+        diag.flags = 1;
+        diag.checksum = calcChecksum((const uint8_t*)&diag, sizeof(diag) - 1);
 
-      if (LoRa.beginPacket()) {
+        LoRa.beginPacket();
         LoRa.write((const uint8_t*)&diag, sizeof(diag));
-        LoRa.endPacket(true); // Non-blocking asynchronous transmit!
+        LoRa.endPacket();
         loraPktCount++;
-        lastSuccessfulTx = millis();
       }
     }
     
@@ -457,7 +450,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div class="badge" id="hudResBadge">QVGA 30FPS</div>
       <div class="badge radio" id="loraBadge">LoRa 433 MHz</div>
       <div class="badge" id="fcBadge">FC: 0 B</div>
-      <div class="badge" id="modeBadge">DISARMED</div>
+      <div class="badge" id="modeBadge">STABILIZE</div>
       <div class="badge" id="batBadge">--.-V (--%)</div>
       <div class="badge" id="altBadge">ALT: 0.0m</div>
       <div class="badge" id="satBadge">SAT: 0</div>
@@ -470,7 +463,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div class="stream-frame" id="streamFrame">
         <div class="hud-layer">
           <div class="hud-top">
-            <div class="hud-tag" id="hudModeTag">DISARMED</div>
+            <div class="hud-tag" id="hudModeTag">[DISARMED] STABILIZE</div>
             <div class="hud-tag" id="hudTimerTag">00:00 | SAT: 0</div>
           </div>
           <div style="display:flex; justify-content:space-between; align-items:flex-end;">
@@ -1061,12 +1054,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           // Flight mode badge & OSD
           const modeBadge = document.getElementById('modeBadge');
           if (modeBadge) {
-            modeBadge.innerText = (data.armed ? 'ARM ' : '') + data.mode;
+            modeBadge.innerText = (data.armed ? 'ARM: ' : '') + data.mode;
             modeBadge.className = data.telem ? 'badge online' : 'badge';
           }
           const hudModeTag = document.getElementById('hudModeTag');
           if (hudModeTag) {
-            hudModeTag.innerText = (data.armed ? 'ARMED ' : 'DISARMED ') + data.mode;
+            hudModeTag.innerText = (data.armed ? '[ARMED] ' : '[DISARMED] ') + data.mode;
             hudModeTag.style.color = data.armed ? 'var(--green)' : 'var(--amber)';
           }
 
@@ -1356,8 +1349,27 @@ void setup() {
   WiFi.softAP(AP_SSID, AP_PASS);
   startCameraServer();
 
-  // 3. Hardware pulse reset and init Ra-02 (SX1278)
-  reinitAirLoRa();
+  // 3. Hardware pulse reset for Ra-02 (SX1278)
+  if (LORA_RST != -1) {
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(10);
+    digitalWrite(LORA_RST, HIGH);
+    delay(10);
+  }
+
+  // Initialize LoRa SPI Bus
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  
+  if (LoRa.begin(433E6)) {
+    loraReady = true;
+    LoRa.setSpreadingFactor(7);           // Fast throughput for MAVLink
+    LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
+    LoRa.setCodingRate4(5);               // 4/5 coding rate
+    LoRa.setSyncWord(0x12);                // Private drone sync word
+    LoRa.setTxPower(20);                   // +20dBm (100mW max RF output)
+  }
 
   // 4. Pin LoRa bridge to Core 0 so video serving on Core 1 never drops packets
   xTaskCreatePinnedToCore(
