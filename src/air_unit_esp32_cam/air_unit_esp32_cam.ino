@@ -20,6 +20,7 @@
 #include <LoRa.h>
 #include <Update.h>
 #include <ArduinoOTA.h>
+#include <WiFiUdp.h>
 #include "esp_http_server.h"
 
 // =================== PIN DEFINITIONS ===================
@@ -98,6 +99,13 @@ void addLog(const char* fmt, ...) {
   logHead = (logHead + 1) % MAX_LOG_LINES;
   if (logCount < MAX_LOG_LINES) logCount++;
 }
+
+// =================== MAVLINK UDP BRIDGE (QGroundControl on Wi-Fi Port 14550) ===================
+WiFiUDP mavUdp;
+IPAddress qgcClientIp(0, 0, 0, 0);
+uint16_t qgcClientPort = 14550;
+bool qgcConnectedViaWifi = false;
+unsigned long lastQgcUdpPacketTime = 0;
 
 httpd_handle_t camera_httpd = NULL; // Port 80 (UI & Real-time Controls)
 httpd_handle_t stream_httpd = NULL; // Port 81 (Dedicated Stream Worker)
@@ -414,11 +422,27 @@ void loraBridgeLoop(void * pvParameters) {
     // 2. Transmit telemetry packet: Fast-flush if mode changed, or when buffer filled, or after quiet gap
     if ((fastFlushRequested && stagingLen > 0) || stagingLen >= 120 || (stagingLen > 0 && (millis() - lastStagingTime >= 15))) {
       fastFlushRequested = false;
+
+      // Forward telemetry to QGroundControl over Wi-Fi UDP (Port 14550) FIRST (instant <0.1ms!)
+      if (WiFi.softAPgetStationNum() > 0) {
+        if (qgcConnectedViaWifi && (millis() - lastQgcUdpPacketTime < 10000)) {
+          mavUdp.beginPacket(qgcClientIp, qgcClientPort);
+          mavUdp.write(stagingBuf, stagingLen);
+          mavUdp.endPacket();
+        } else {
+          mavUdp.beginPacket(IPAddress(192, 168, 4, 255), 14550);
+          mavUdp.write(stagingBuf, stagingLen);
+          mavUdp.endPacket();
+        }
+      }
+
+      // Transmit telemetry over LoRa (SX1278) for Ground Station
       if (loraReady) {
         if (safeLoRaSend(stagingBuf, stagingLen)) {
           loraPktCount++;
         }
       }
+
       stagingLen = 0;
 
       // 3. Dedicated Uplink Receive Window (75ms)
@@ -439,10 +463,10 @@ void loraBridgeLoop(void * pvParameters) {
 
         // B. If F405 answered with COMMAND_ACK (Msg 77) or STATUSTEXT (Msg 253), flush IMMEDIATELY!
         if (fastFlushRequested && stagingLen > 0) {
-          break; // Break out of receive window immediately to transmit ACK to Ground Station!
+          break; // Break out of receive window immediately to transmit ACK to Ground Station & QGC!
         }
 
-        // C. Check for incoming uplink packets from Ground Station
+        // C. Check for incoming uplink packets from Ground Station over LoRa
         if (loraReady) {
           int packetSize = LoRa.parsePacket();
           if (packetSize > 0) {
@@ -456,10 +480,24 @@ void loraBridgeLoop(void * pvParameters) {
             rxStart = millis();
           }
         }
+
+        // D. Check for incoming MAVLink packets from QGC over Wi-Fi UDP (Port 14550)
+        int udpRx;
+        while ((udpRx = mavUdp.parsePacket()) > 0) {
+          qgcClientIp = mavUdp.remoteIP();
+          qgcClientPort = mavUdp.remotePort();
+          qgcConnectedViaWifi = true;
+          lastQgcUdpPacketTime = millis();
+          addLog("WIFI RX: %d B from QGC -> sent to F405 (R6)", udpRx);
+          while (mavUdp.available()) {
+            Serial.write((uint8_t)mavUdp.read());
+          }
+        }
+
         vTaskDelay(2 / portTICK_PERIOD_MS);
       }
     } else {
-      // 4. If idle, drain FC Serial and check for incoming LoRa packets
+      // 4. If idle, drain FC Serial and check for incoming LoRa & UDP packets
       while (Serial.available()) {
         uint8_t b = Serial.read();
         fcByteCount++;
@@ -476,6 +514,17 @@ void loraBridgeLoop(void * pvParameters) {
           while (LoRa.available()) {
             Serial.write((uint8_t)LoRa.read());
           }
+        }
+      }
+      int udpRx;
+      while ((udpRx = mavUdp.parsePacket()) > 0) {
+        qgcClientIp = mavUdp.remoteIP();
+        qgcClientPort = mavUdp.remotePort();
+        qgcConnectedViaWifi = true;
+        lastQgcUdpPacketTime = millis();
+        addLog("WIFI RX: %d B (idle) -> sent to F405 (R6)", udpRx);
+        while (mavUdp.available()) {
+          Serial.write((uint8_t)mavUdp.read());
         }
       }
     }
@@ -640,9 +689,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div class="badge online"><span class="pulse-dot"></span>Stream :81</div>
       <div class="badge" id="hudResBadge">QVGA 30FPS</div>
       <div class="badge radio" id="loraBadge">LoRa 433 MHz</div>
+      <div class="badge online" id="udpBadge">MAV UDP :14550</div>
       <a href="/update" class="badge radio" style="text-decoration:none;cursor:pointer;">OTA Flash</a>
       <a href="/logs" target="_blank" class="badge" style="text-decoration:none;cursor:pointer;color:var(--amber);border-color:var(--amber);">Live Logs</a>
-      <div class="badge" style="color:var(--accent);">FW v2.2</div>
+      <div class="badge" style="color:var(--accent);">FW v2.3</div>
       <div class="badge" id="fcBadge">FC: 0 B</div>
       <div class="badge" id="modeBadge">STABILIZE</div>
       <div class="badge" id="batBadge">--.-V (--%)</div>
@@ -1803,7 +1853,10 @@ void setup() {
   // 5. Initialize ArduinoOTA for direct one-click wireless flashing from Arduino IDE
   ArduinoOTA.setHostname("esp32-cam");
   ArduinoOTA.begin();
-  addLog("Air Unit Booted. FW: v2.2 (ArduinoOTA + Logs)");
+
+  // 6. Initialize MAVLink UDP Bridge on standard port 14550 for QGC Wi-Fi Direct Connection
+  mavUdp.begin(14550);
+  addLog("Air Unit Booted. FW: v2.3 (MAVLink UDP 14550 + LoRa)");
 }
 
 void loop() {
