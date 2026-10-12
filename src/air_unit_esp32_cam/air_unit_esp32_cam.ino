@@ -77,6 +77,7 @@ volatile float droneAltitude = 0.0;
 volatile int droneSats = 0;
 volatile float droneSpeed = 0.0;
 volatile unsigned long lastMavlinkTime = 0;
+volatile bool fastFlushRequested = false; // Fast-forward mode changes and emergency alerts over LoRa
 
 httpd_handle_t camera_httpd = NULL; // Port 80 (UI & Real-time Controls)
 httpd_handle_t stream_httpd = NULL; // Port 81 (Dedicated Stream Worker)
@@ -179,7 +180,15 @@ void parseAirMavlinkByte(uint8_t c) {
         // 1. HEARTBEAT (Msg #0)
         if (msgId == 0 && payloadLen >= 9) {
           uint32_t customMode = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
-          droneArmed = (buf[6] & 128) != 0;
+          bool newArmed = (buf[6] & 128) != 0;
+          static uint32_t lastAirMode = 0xFFFFFFFF;
+          static bool lastAirArmed = false;
+          if (customMode != lastAirMode || newArmed != lastAirArmed) {
+            lastAirMode = customMode;
+            lastAirArmed = newArmed;
+            fastFlushRequested = true; // RC Remote mode or arm status changed -> Immediate LoRa TX!
+          }
+          droneArmed = newArmed;
           switch (customMode) {
             case 0:  strcpy(flightMode, "STABILIZE"); break;
             case 1:  strcpy(flightMode, "ACRO");      break;
@@ -217,6 +226,10 @@ void parseAirMavlinkByte(uint8_t c) {
         // 4. GPS_RAW_INT (Msg #24)
         else if (msgId == 24 && payloadLen >= 30) {
           droneSats = buf[29];
+        }
+        // 5. STATUSTEXT (Msg #253) - Flight mode announcements & warning toasts
+        else if (msgId == 253) {
+          fastFlushRequested = true; // Send mode change notifications instantly to QGC
         }
 
         state = 30;
@@ -330,8 +343,9 @@ void loraBridgeLoop(void * pvParameters) {
       lastStagingTime = millis();
     }
 
-    // 2. Transmit coalesced telemetry packet when buffer has target payload or after quiet gap
-    if (stagingLen >= 120 || (stagingLen > 0 && (millis() - lastStagingTime >= 15))) {
+    // 2. Transmit telemetry packet: Fast-flush if mode changed, or when buffer filled, or after quiet gap
+    if ((fastFlushRequested && stagingLen > 0) || stagingLen >= 120 || (stagingLen > 0 && (millis() - lastStagingTime >= 15))) {
+      fastFlushRequested = false;
       if (loraReady) {
         if (safeLoRaSend(stagingBuf, stagingLen)) {
           loraPktCount++;
@@ -1423,7 +1437,13 @@ void setup() {
   }
 
   // 2. Initialize Wi-Fi Soft AP & Dual-Port HTTP Server
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false); // Disable modem sleep so Windows EAPOL handshakes never drop
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 4); // Channel 6, visible, max 4 clients
   startCameraServer();
 
   // 3. Hardware pulse reset for Ra-02 (SX1278)

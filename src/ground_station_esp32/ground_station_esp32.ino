@@ -213,6 +213,9 @@ void parseMavlinkByte(uint8_t c) {
         // 1. HEARTBEAT (Message #0): Decode ArduCopter Flight Mode
         if (msgId == 0 && payloadLen >= 9) {
           uint32_t customMode = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+          static uint32_t lastStationMode = 0xFFFFFFFF;
+          bool modeChanged = (customMode != lastStationMode);
+          lastStationMode = customMode;
           switch (customMode) {
             case 0:  strcpy(flightMode, "STABILIZE"); break;
             case 1:  strcpy(flightMode, "ACRO");      break;
@@ -231,6 +234,9 @@ void parseMavlinkByte(uint8_t c) {
             case 17: strcpy(flightMode, "BRAKE");     break;
             case 21: strcpy(flightMode, "SMART_RTL"); break;
             default: strcpy(flightMode, "CUSTOM");    break;
+          }
+          if (modeChanged && oledReady) {
+            updateOLED(); // Refresh transmitter OLED immediately on mode change!
           }
         }
         // 2. SYS_STATUS (Message #1): Drone 3S LiPo Voltage & Percentage
