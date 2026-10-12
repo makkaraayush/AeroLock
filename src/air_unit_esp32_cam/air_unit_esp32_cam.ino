@@ -199,17 +199,11 @@ void parseAirMavlinkByte(uint8_t c) {
 
         // 1. HEARTBEAT (Msg #0)
         if (msgId == 0 && payloadLen >= 9) {
-          uint32_t customMode = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+          uint32_t customMode = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
           bool newArmed = (buf[6] & 128) != 0;
-          static uint32_t lastAirMode = 0xFFFFFFFF;
-          static bool lastAirArmed = false;
-          if (customMode != lastAirMode || newArmed != lastAirArmed) {
-            lastAirMode = customMode;
-            lastAirArmed = newArmed;
-            fastFlushRequested = true; // RC Remote mode or arm status changed -> Immediate LoRa TX!
-            addLog("FC MODE: %s [Armed=%d]", flightMode, newArmed ? 1 : 0);
-          }
           droneArmed = newArmed;
+
+          // Decode all ArduCopter flight modes
           switch (customMode) {
             case 0:  strcpy(flightMode, "STABILIZE"); break;
             case 1:  strcpy(flightMode, "ACRO");      break;
@@ -226,8 +220,23 @@ void parseAirMavlinkByte(uint8_t c) {
             case 15: strcpy(flightMode, "AUTOTUNE");  break;
             case 16: strcpy(flightMode, "POSHOLD");   break;
             case 17: strcpy(flightMode, "BRAKE");     break;
+            case 18: strcpy(flightMode, "THROW");     break;
+            case 20: strcpy(flightMode, "GUIDED_NOGPS"); break;
             case 21: strcpy(flightMode, "SMART_RTL"); break;
-            default: strcpy(flightMode, "CUSTOM");    break;
+            case 22: strcpy(flightMode, "FLOWHOLD");  break;
+            case 23: strcpy(flightMode, "FOLLOW");    break;
+            case 24: strcpy(flightMode, "ZIGZAG");    break;
+            case 27: strcpy(flightMode, "AUTO_RTL");  break;
+            default: break; // NEVER overwrite valid flight mode with "CUSTOM"!
+          }
+
+          static uint32_t lastAirMode = 0xFFFFFFFF;
+          static bool lastAirArmed = false;
+          if (customMode != lastAirMode || newArmed != lastAirArmed) {
+            lastAirMode = customMode;
+            lastAirArmed = newArmed;
+            fastFlushRequested = true; // RC Remote mode or arm status changed -> Immediate LoRa TX!
+            addLog("FC MODE: %s [Armed=%d]", flightMode, newArmed ? 1 : 0);
           }
         }
         // 2. SYS_STATUS (Msg #1)
@@ -251,10 +260,33 @@ void parseAirMavlinkByte(uint8_t c) {
         // 5. STATUSTEXT (Msg #253) - Flight mode announcements & warning toasts
         else if (msgId == 253) {
           fastFlushRequested = true; // Send mode change notifications instantly to QGC
-          char tBuf[40];
-          memset(tBuf, 0, sizeof(tBuf));
-          strncpy(tBuf, (char*)&buf[1], sizeof(tBuf) - 1);
+          char tBuf[51];
+          int tLen = (payloadLen > 1) ? payloadLen - 1 : 0;
+          if (tLen > 50) tLen = 50;
+          memcpy(tBuf, (char*)&buf[1], tLen);
+          tBuf[tLen] = '\0';
           addLog("FC TOAST: %s", tBuf);
+
+          // Instant flight mode extraction from "Mode <MODE_NAME>" (0ms delay!)
+          char* mPtr = strstr(tBuf, "Mode ");
+          if (mPtr != NULL) {
+            char* mName = mPtr + 5;
+            while (*mName == ' ') mName++;
+            if (strlen(mName) >= 3) {
+              char cleanMode[16];
+              int idx = 0;
+              while (mName[idx] && mName[idx] != ' ' && mName[idx] != '\r' && mName[idx] != '\n' && idx < 15) {
+                char ch = mName[idx];
+                if (ch >= 'a' && ch <= 'z') ch -= 32;
+                cleanMode[idx++] = ch;
+              }
+              cleanMode[idx] = '\0';
+              if (idx >= 3) {
+                strcpy(flightMode, cleanMode);
+                addLog("INSTANT MODE: %s", flightMode);
+              }
+            }
+          }
         }
         // 6. COMMAND_ACK (Msg #77) - Critical Arm / Disarm / Mode / Takeoff acknowledgment
         else if (msgId == 77) {
@@ -394,6 +426,23 @@ void loraBridgeLoop(void * pvParameters) {
       unsigned long rxStart = millis();
       unsigned long windowLimit = millis();
       while ((millis() - rxStart < 75) && (millis() - windowLimit < 160)) {
+        // A. Concurrently read and parse F405 FC UART so ACKs are NEVER delayed!
+        while (Serial.available()) {
+          uint8_t b = Serial.read();
+          fcByteCount++;
+          parseAirMavlinkByte(b);
+          if (stagingLen < sizeof(stagingBuf)) {
+            stagingBuf[stagingLen++] = b;
+          }
+          lastStagingTime = millis();
+        }
+
+        // B. If F405 answered with COMMAND_ACK (Msg 77) or STATUSTEXT (Msg 253), flush IMMEDIATELY!
+        if (fastFlushRequested && stagingLen > 0) {
+          break; // Break out of receive window immediately to transmit ACK to Ground Station!
+        }
+
+        // C. Check for incoming uplink packets from Ground Station
         if (loraReady) {
           int packetSize = LoRa.parsePacket();
           if (packetSize > 0) {
@@ -410,7 +459,16 @@ void loraBridgeLoop(void * pvParameters) {
         vTaskDelay(2 / portTICK_PERIOD_MS);
       }
     } else {
-      // 4. If idle, check for incoming LoRa packets (Ground Station commands)
+      // 4. If idle, drain FC Serial and check for incoming LoRa packets
+      while (Serial.available()) {
+        uint8_t b = Serial.read();
+        fcByteCount++;
+        parseAirMavlinkByte(b);
+        if (stagingLen < sizeof(stagingBuf)) {
+          stagingBuf[stagingLen++] = b;
+        }
+        lastStagingTime = millis();
+      }
       if (loraReady) {
         int packetSize = LoRa.parsePacket();
         if (packetSize > 0) {

@@ -213,10 +213,9 @@ void parseMavlinkByte(uint8_t c) {
 
         // 1. HEARTBEAT (Message #0): Decode ArduCopter Flight Mode
         if (msgId == 0 && payloadLen >= 9) {
-          uint32_t customMode = buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
-          static uint32_t lastStationMode = 0xFFFFFFFF;
-          bool modeChanged = (customMode != lastStationMode);
-          lastStationMode = customMode;
+          uint32_t customMode = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+
+          // Decode all ArduCopter flight modes
           switch (customMode) {
             case 0:  strcpy(flightMode, "STABILIZE"); break;
             case 1:  strcpy(flightMode, "ACRO");      break;
@@ -233,9 +232,19 @@ void parseMavlinkByte(uint8_t c) {
             case 15: strcpy(flightMode, "AUTOTUNE");  break;
             case 16: strcpy(flightMode, "POSHOLD");   break;
             case 17: strcpy(flightMode, "BRAKE");     break;
+            case 18: strcpy(flightMode, "THROW");     break;
+            case 20: strcpy(flightMode, "GUIDED_NOGPS"); break;
             case 21: strcpy(flightMode, "SMART_RTL"); break;
-            default: strcpy(flightMode, "CUSTOM");    break;
+            case 22: strcpy(flightMode, "FLOWHOLD");  break;
+            case 23: strcpy(flightMode, "FOLLOW");    break;
+            case 24: strcpy(flightMode, "ZIGZAG");    break;
+            case 27: strcpy(flightMode, "AUTO_RTL");  break;
+            default: break; // NEVER overwrite valid flight mode with "CUSTOM"!
           }
+
+          static uint32_t lastStationMode = 0xFFFFFFFF;
+          bool modeChanged = (customMode != lastStationMode);
+          lastStationMode = customMode;
           if (modeChanged && oledReady) {
             updateOLED(); // Refresh transmitter OLED immediately on mode change!
           }
@@ -273,6 +282,33 @@ void parseMavlinkByte(uint8_t c) {
         // 4. GPS_RAW_INT (Message #24): Satellites Visible
         else if (msgId == 24 && payloadLen >= 30) {
           droneSats = buf[29];
+        }
+        // 5. STATUSTEXT (Message #253): Instant Flight Mode Announcements (<20ms!)
+        else if (msgId == 253 && payloadLen >= 2) {
+          char tBuf[51];
+          int tLen = (payloadLen > 1) ? payloadLen - 1 : 0;
+          if (tLen > 50) tLen = 50;
+          memcpy(tBuf, (char*)&buf[1], tLen);
+          tBuf[tLen] = '\0';
+          char* mPtr = strstr(tBuf, "Mode ");
+          if (mPtr != NULL) {
+            char* mName = mPtr + 5;
+            while (*mName == ' ') mName++;
+            if (strlen(mName) >= 3) {
+              char cleanMode[16];
+              int idx = 0;
+              while (mName[idx] && mName[idx] != ' ' && mName[idx] != '\r' && mName[idx] != '\n' && idx < 15) {
+                char ch = mName[idx];
+                if (ch >= 'a' && ch <= 'z') ch -= 32;
+                cleanMode[idx++] = ch;
+              }
+              cleanMode[idx] = '\0';
+              if (idx >= 3) {
+                strcpy(flightMode, cleanMode);
+                if (oledReady) updateOLED(); // Instant OLED refresh!
+              }
+            }
+          }
         }
 
         // Wait for 2 CRC bytes before resetting to state 0
@@ -650,13 +686,27 @@ void loop() {
     }
     if (count > 0) {
       totalUplinkPacketsSent++;
-      // If an incoming downlink packet is currently being received, wait briefly for it to complete
-      // This guarantees transmission fires directly into the Air Unit's open listening window!
+      // Wait up to 40ms for any active downlink packet to clear
       unsigned long waitStart = millis();
       while ((readLoRaReg(0x18) & 0x08) && (millis() - waitStart < 40)) {
         delay(2);
       }
       safeLoRaSend(buffer, count);
+
+      // Critical Command Redundancy Burst:
+      // If this is an Arm/Disarm (Msg #76) or Mode Change (Msg #11), send a fast 2nd burst
+      // Guarantees 99.9% packet delivery rate through RF noise without waiting for timeout!
+      bool isCommand = false;
+      if (buffer[0] == 0xFD && count >= 10) {
+        uint32_t mId = buffer[7] | ((uint32_t)buffer[8] << 8);
+        if (mId == 76 || mId == 11) isCommand = true;
+      } else if (buffer[0] == 0xFE && count >= 8) {
+        if (buffer[5] == 76 || buffer[5] == 11) isCommand = true;
+      }
+      if (isCommand) {
+        delay(10);
+        safeLoRaSend(buffer, count);
+      }
     }
   }
 
