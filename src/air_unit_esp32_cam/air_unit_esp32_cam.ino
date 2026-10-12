@@ -19,6 +19,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <Update.h>
+#include <ArduinoOTA.h>
 #include "esp_http_server.h"
 
 // =================== PIN DEFINITIONS ===================
@@ -79,6 +80,24 @@ volatile int droneSats = 0;
 volatile float droneSpeed = 0.0;
 volatile unsigned long lastMavlinkTime = 0;
 volatile bool fastFlushRequested = false; // Fast-forward mode changes and emergency alerts over LoRa
+
+// =================== LIVE DIAGNOSTIC LOG BUFFER ===================
+#define MAX_LOG_LINES 30
+static char logBuffer[MAX_LOG_LINES][100];
+static uint8_t logHead = 0;
+static uint8_t logCount = 0;
+
+void addLog(const char* fmt, ...) {
+  char temp[80];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(temp, sizeof(temp), fmt, args);
+  va_end(args);
+
+  snprintf(logBuffer[logHead], sizeof(logBuffer[logHead]), "[%06lu] %s", millis() / 1000, temp);
+  logHead = (logHead + 1) % MAX_LOG_LINES;
+  if (logCount < MAX_LOG_LINES) logCount++;
+}
 
 httpd_handle_t camera_httpd = NULL; // Port 80 (UI & Real-time Controls)
 httpd_handle_t stream_httpd = NULL; // Port 81 (Dedicated Stream Worker)
@@ -188,6 +207,7 @@ void parseAirMavlinkByte(uint8_t c) {
             lastAirMode = customMode;
             lastAirArmed = newArmed;
             fastFlushRequested = true; // RC Remote mode or arm status changed -> Immediate LoRa TX!
+            addLog("FC MODE: %s [Armed=%d]", flightMode, newArmed ? 1 : 0);
           }
           droneArmed = newArmed;
           switch (customMode) {
@@ -231,10 +251,17 @@ void parseAirMavlinkByte(uint8_t c) {
         // 5. STATUSTEXT (Msg #253) - Flight mode announcements & warning toasts
         else if (msgId == 253) {
           fastFlushRequested = true; // Send mode change notifications instantly to QGC
+          char tBuf[40];
+          memset(tBuf, 0, sizeof(tBuf));
+          strncpy(tBuf, (char*)&buf[1], sizeof(tBuf) - 1);
+          addLog("FC TOAST: %s", tBuf);
         }
         // 6. COMMAND_ACK (Msg #77) - Critical Arm / Disarm / Mode / Takeoff acknowledgment
         else if (msgId == 77) {
           fastFlushRequested = true; // Flush COMMAND_ACK immediately so QGC gets confirmation within 100ms!
+          uint16_t cmd = buf[0] | (buf[1] << 8);
+          uint8_t res = (payloadLen >= 3) ? buf[2] : 255;
+          addLog("FC ACK: Msg #77 Cmd %u, Res %u", cmd, res);
         }
         // 7. Mission negotiation: MISSION_ACK (47), MISSION_REQUEST (40), MISSION_COUNT (44)
         else if (msgId == 47 || msgId == 40 || msgId == 44) {
@@ -369,6 +396,7 @@ void loraBridgeLoop(void * pvParameters) {
         if (loraReady) {
           int packetSize = LoRa.parsePacket();
           if (packetSize > 0) {
+            addLog("LORA RX: %d B uplink -> sent to F405 (R6)", packetSize);
             while (LoRa.available()) {
               Serial.write((uint8_t)LoRa.read());
             }
@@ -385,6 +413,7 @@ void loraBridgeLoop(void * pvParameters) {
       if (loraReady) {
         int packetSize = LoRa.parsePacket();
         if (packetSize > 0) {
+          addLog("LORA RX: %d B uplink (idle) -> sent to F405 (R6)", packetSize);
           while (LoRa.available()) {
             Serial.write((uint8_t)LoRa.read());
           }
@@ -553,6 +582,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div class="badge" id="hudResBadge">QVGA 30FPS</div>
       <div class="badge radio" id="loraBadge">LoRa 433 MHz</div>
       <a href="/update" class="badge radio" style="text-decoration:none;cursor:pointer;">OTA Flash</a>
+      <a href="/logs" target="_blank" class="badge" style="text-decoration:none;cursor:pointer;color:var(--amber);border-color:var(--amber);">Live Logs</a>
+      <div class="badge" style="color:var(--accent);">FW v2.2</div>
       <div class="badge" id="fcBadge">FC: 0 B</div>
       <div class="badge" id="modeBadge">STABILIZE</div>
       <div class="badge" id="batBadge">--.-V (--%)</div>
@@ -1554,13 +1585,37 @@ static esp_err_t update_post_handler(httpd_req_t *req) {
   return ESP_FAIL;
 }
 
+// =================== LIVE DIAGNOSTIC LOG ENDPOINT ===================
+static esp_err_t logs_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Refresh", "2"); // Auto-refresh browser every 2 seconds
+
+  char outBuf[160];
+  int count = logCount;
+  int startIdx = (logHead - count + MAX_LOG_LINES) % MAX_LOG_LINES;
+
+  httpd_resp_send_chunk(req, "=== AIR UNIT LIVE DIAGNOSTIC LOG (Auto-Refresh 2s) ===\n", HTTPD_RESP_USE_STRLEN);
+  httpd_resp_send_chunk(req, "Firmware: v2.2 (ArduinoOTA + Live Logging)\n", HTTPD_RESP_USE_STRLEN);
+  snprintf(outBuf, sizeof(outBuf), "FC UART Bytes: %lu | LoRa TX Packets: %lu | Radio Ready: %d\n", fcByteCount, loraPktCount, (int)loraReady);
+  httpd_resp_send_chunk(req, outBuf, HTTPD_RESP_USE_STRLEN);
+  httpd_resp_send_chunk(req, "------------------------------------------------------\n", HTTPD_RESP_USE_STRLEN);
+
+  for (int i = 0; i < count; i++) {
+    int idx = (startIdx + i) % MAX_LOG_LINES;
+    snprintf(outBuf, sizeof(outBuf), "%s\n", logBuffer[idx]);
+    httpd_resp_send_chunk(req, outBuf, HTTPD_RESP_USE_STRLEN);
+  }
+  return httpd_resp_send_chunk(req, NULL, 0);
+}
+
 // Start Dual-Port Web & Stream Architecture
 void startCameraServer() {
   // 1. Port 80 Server: Dedicated to Cockpit UI and Instant Controls
   httpd_config_t config_ui = HTTPD_DEFAULT_CONFIG();
   config_ui.server_port = 80;
   config_ui.ctrl_port = 32768; // Primary control port
-  config_ui.max_uri_handlers = 8;
+  config_ui.max_uri_handlers = 10;
   config_ui.stack_size = 8192; // 8KB stack for smooth flash writes
 
   httpd_uri_t index_uri   = { .uri = "/",        .method = HTTP_GET,  .handler = index_handler,       .user_ctx = NULL };
@@ -1569,6 +1624,7 @@ void startCameraServer() {
   httpd_uri_t status_uri  = { .uri = "/status",  .method = HTTP_GET,  .handler = status_handler,      .user_ctx = NULL };
   httpd_uri_t update_get  = { .uri = "/update",  .method = HTTP_GET,  .handler = update_get_handler,  .user_ctx = NULL };
   httpd_uri_t update_post = { .uri = "/update",  .method = HTTP_POST, .handler = update_post_handler, .user_ctx = NULL };
+  httpd_uri_t logs_uri    = { .uri = "/logs",    .method = HTTP_GET,  .handler = logs_handler,        .user_ctx = NULL };
 
   if (httpd_start(&camera_httpd, &config_ui) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
@@ -1577,6 +1633,7 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &update_get);
     httpd_register_uri_handler(camera_httpd, &update_post);
+    httpd_register_uri_handler(camera_httpd, &logs_uri);
   }
 
   // 2. Port 81 Server: Dedicated Exclusively to the MJPEG Stream
@@ -1683,9 +1740,14 @@ void setup() {
     &LoRaBridgeTask,
     0
   );
+
+  // 5. Initialize ArduinoOTA for direct one-click wireless flashing from Arduino IDE
+  ArduinoOTA.setHostname("esp32-cam");
+  ArduinoOTA.begin();
+  addLog("Air Unit Booted. FW: v2.2 (ArduinoOTA + Logs)");
 }
 
 void loop() {
-  // Loop is free because both http servers run asynchronously in their own FreeRTOS worker tasks
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  ArduinoOTA.handle();
+  vTaskDelay(20 / portTICK_PERIOD_MS);
 }
