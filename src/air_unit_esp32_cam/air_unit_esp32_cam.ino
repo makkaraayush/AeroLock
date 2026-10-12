@@ -1437,13 +1437,7 @@ void setup() {
   }
 
   // 2. Initialize Wi-Fi Soft AP & Dual-Port HTTP Server
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false); // Disable modem sleep so Windows EAPOL handshakes never drop
-  IPAddress local_ip(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.softAPConfig(local_ip, gateway, subnet);
-  WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 4); // Channel 6, visible, max 4 clients
+  WiFi.softAP(AP_SSID, AP_PASS);
   startCameraServer();
 
   // 3. Hardware pulse reset for Ra-02 (SX1278)
