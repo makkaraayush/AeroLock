@@ -392,7 +392,8 @@ void loraBridgeLoop(void * pvParameters) {
       // 3. Dedicated Uplink Receive Window (75ms)
       // Grants Ground Station (QGroundControl) clear airtime to send Arm, Takeoff, Mode, Waypoints, & Parameters!
       unsigned long rxStart = millis();
-      while (millis() - rxStart < 75) {
+      unsigned long windowLimit = millis();
+      while ((millis() - rxStart < 75) && (millis() - windowLimit < 160)) {
         if (loraReady) {
           int packetSize = LoRa.parsePacket();
           if (packetSize > 0) {

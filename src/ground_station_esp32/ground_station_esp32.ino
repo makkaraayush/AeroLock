@@ -67,6 +67,7 @@ unsigned long lastDisplayUpdate  = 0;
 unsigned long lastBatCheckTime   = 0;
 bool oledReady = false;
 volatile uint32_t totalLoRaPacketsReceived = 0;
+volatile uint32_t totalUplinkPacketsSent = 0;
 volatile unsigned long lastAirPingTime = 0;
 volatile uint32_t airFcBytes = 0;
 volatile int lastPacketRssi = 0;
@@ -453,15 +454,16 @@ void updateOLED() {
       display.drawLine(0, 36, 128, 36, SSD1306_WHITE);
 
       display.setCursor(0, 40);
-      display.print("PKT : ");
+      display.print("RX:");
       display.print(totalLoRaPacketsReceived);
-      display.print(" TOTAL");
+      display.print(" UP:");
+      display.print(totalUplinkPacketsSent);
 
       display.setCursor(0, 52);
-      display.print("FC  : ");
+      display.print("FC:");
       if (airFcBytes > 1024) {
         display.print(airFcBytes / 1024.0, 1);
-        display.print("KB");
+        display.print("K");
       } else {
         display.print(airFcBytes);
         display.print("B");
@@ -621,16 +623,17 @@ void loop() {
         // Cleanly handled internal diagnostic heartbeat; do not forward to QGroundControl
       }
     } else {
-      // Forward standard MAVLink telemetry bytes to Bluetooth and local OLED parser
+      // Forward standard MAVLink telemetry bytes to BOTH Bluetooth and USB Serial
       for (int i = 0; i < len; i++) {
-        SerialBT.write(rxBuf[i]);   // Send byte to QGroundControl on phone
+        SerialBT.write(rxBuf[i]);   // Send byte to QGroundControl on phone (Bluetooth)
+        Serial.write(rxBuf[i]);     // Send byte to QGroundControl on PC (USB Serial)
         parseMavlinkByte(rxBuf[i]); // Extract telemetry for local OLED display
       }
     }
   }
 
-  // 2. Receive commands from Phone (BT) -> Forward to Drone over LoRa
-  if (SerialBT.available()) {
+  // 2. Receive commands from Phone (BT) OR PC (USB Serial) -> Forward to Drone over LoRa
+  if (SerialBT.available() || Serial.available()) {
     uint8_t buffer[160];
     int count = 0;
     unsigned long startRead = millis();
@@ -638,11 +641,15 @@ void loop() {
       if (SerialBT.available()) {
         buffer[count++] = SerialBT.read();
         startRead = millis();
+      } else if (Serial.available()) {
+        buffer[count++] = Serial.read();
+        startRead = millis();
       } else {
         delay(1);
       }
     }
     if (count > 0) {
+      totalUplinkPacketsSent++;
       // If an incoming downlink packet is currently being received, wait briefly for it to complete
       // This guarantees transmission fires directly into the Air Unit's open listening window!
       unsigned long waitStart = millis();
