@@ -692,7 +692,22 @@ void loop() {
         delay(2);
       }
       safeLoRaSend(buffer, count);
-      LoRa.parsePacket(); // Immediately enter RX mode to capture FC COMMAND_ACK without RF collision!
+
+      // Critical Command Redundancy Burst:
+      // If this is an Arm/Disarm (Msg #76) or Mode Change (Msg #11), send a fast 2nd burst
+      // Guarantees high packet delivery rate through RF noise and packet timing offsets!
+      bool isCommand = false;
+      if (buffer[0] == 0xFD && count >= 10) {
+        uint32_t mId = buffer[7] | ((uint32_t)buffer[8] << 8);
+        if (mId == 76 || mId == 11) isCommand = true;
+      } else if (buffer[0] == 0xFE && count >= 8) {
+        if (buffer[5] == 76 || buffer[5] == 11) isCommand = true;
+      }
+      if (isCommand) {
+        delay(10);
+        safeLoRaSend(buffer, count);
+      }
+      LoRa.parsePacket(); // Immediately enter RX mode
     }
   }
 
