@@ -85,3 +85,61 @@ Next up: Calibrating all the ESCs together and starting the tuning process!
   1. **Low-Battery Failsafe Set to Land (`BATT_FS_LOW_ACT = 1`):** Changed the low battery failsafe from RTL to Land. If battery voltage drops critically, the drone now executes a smooth vertical descent on the spot instead of climbing or attempting cross-neighborhood transit on dying cells.
   2. **RTL Return Altitude Raised to 22m (`RTL_ALT = 2200`):** For intentional, switch-activated Return-To-Launch, the return cruise altitude was increased from 15m to 22m (2200cm). This permanently guarantees the quad cruises safely above the tallest local tree canopies (~18-20m), eliminating any future tree collision hazard during autonomous return flights.
 
+### Issue 12: MAVLink Telemetry UART Dropouts & Flight Controller Silence
+- **What happened:** After wiring the ESP32-CAM to UART6 on the DakeFPV F405, the ESP32-CAM was either receiving zero bytes or intermittent garbage from the flight controller. The Web Cockpit HUD showed 0 bytes received from FC, and no telemetry reached the Ground Station.
+- **Diagnostics:**
+  - Tested direct USB-C connection to PC: Mission Planner received telemetry perfectly over USB, confirming ArduPilot was alive.
+  - Inspected UART6 hardware: Checked solder joints on TX6 and RX6. Continuity was good, but no data frames were being received by the ESP32-CAM.
+- **The Root Cause:**
+  - `SERIAL6_PROTOCOL` in ArduPilot was not set to MAVLink 2 (`SERIAL6_PROTOCOL = 2`).
+  - `SERIAL6_BAUD` defaulted to 57 (57600 baud), while the ESP32-CAM was listening at 19200 baud to match the LoRa airtime throughput.
+  - Hardware flow control (`BRD_SER6_RTSCTS`) was enabled or floating, stalling the serial transmit buffer because the ESP32-CAM does not break out RTS/CTS pins.
+  - ArduPilot default stream rates on unassigned serial ports were set to 0 Hz, meaning ArduPilot was not actively streaming telemetry streams without explicit requests.
+- **The Fix:**
+  - Configured ArduPilot serial parameters in Mission Planner:
+    - `SERIAL6_PROTOCOL = 2` (MAVLink 2)
+    - `SERIAL6_BAUD = 19` (19200 baud)
+    - `BRD_SER6_RTSCTS = 0` (Disable hardware flow control)
+    - `SR6_EXT_STAT = 2` (2 Hz system status)
+    - `SR6_EXTRA1 = 4` (4 Hz attitude & mode)
+    - `SR6_EXTRA2 = 4` (4 Hz VFR HUD)
+    - `SR6_POSITION = 3` (3 Hz GPS position)
+    - `SR6_RAW_SENS = 2` (2 Hz sensor health)
+  - Telemetry bytes began streaming continuously into the ESP32-CAM at ~1.5 KB/s.
+
+### Issue 13: "Vehicle 1 Did Not Respond to Command: Arm/Disarm" & Mode Lag
+- **What happened:** When commanding Arm/Disarm or switching to Guided mode from QGroundControl via Bluetooth, QGC frequently displayed an error toast: "Vehicle 1 did not respond to command: Arm/Disarm". Clicking the button multiple times with brief pauses occasionally worked, but often timed out. In addition, changing flight modes from the RC transmitter took several seconds to reflect on the Ground Station OLED, and occasionally misidentified valid modes as "CUSTOM".
+- **Diagnostics:**
+  - Direct USB cable test from PC to F405: Arming and mode changes responded instantly in QGC, confirming the flight controller itself was not rejecting commands.
+  - LoRa packet tracing: The Ground Station was sending MAVLink `COMMAND_LONG` (Msg #76) across the LoRa link. The Air Unit received it and passed it to the F405 via UART6. The F405 executed the arm command and returned `COMMAND_ACK` (Msg #77). However, QGC timed out waiting for the acknowledgment.
+- **The Root Cause:**
+  1. *Half-Duplex Radio Collisions:* The SX1278 LoRa transceiver cannot transmit and receive at the same time. At SF7 / 250kHz, sending a command takes ~35 ms. When commands were transmitted, the Ground Station fired back-to-back bursts. Meanwhile, the F405 responded with `COMMAND_ACK` within 10 ms. Because the Ground Station was actively in transmit mode sending the second burst, its receiver was disabled, clobbering the incoming `COMMAND_ACK` packet.
+  2. *Mode Detection Latency & CUSTOM Fallback:* The firmware previously relied solely on the 1 Hz `HEARTBEAT` message (Msg #0) to update the flight mode. If a heartbeat was dropped over RF, the mode display was delayed by multiple seconds. Furthermore, the mode decoder had an unhandled default switch case that actively overwrote valid flight modes with "CUSTOM" whenever an unmapped mode ID or malformed packet was received.
+- **The Fix:**
+  1. *Instant Mode Extraction via STATUSTEXT (Msg #253):* ArduPilot immediately broadcasts a `STATUSTEXT` text toast ("Mode <MODE_NAME>") whenever the flight mode changes. Added regex-style parsing in both the Air Unit and Ground Station firmware to extract the mode string directly from Msg #253. Mode switches now display on the OLED and Web HUD in under 20 ms.
+  2. *Protected Mode Table:* Expanded the ArduCopter mode switch to cover all 28 official modes, and removed the destructive "CUSTOM" overwrite in the default handler.
+  3. *Immediate ACK Prioritization & Managed Redundancy:* Configured the Air Unit to detect `COMMAND_ACK` (Msg #77) and break out of its receive window immediately (`fastFlushRequested = true`), pushing the acknowledgment over LoRa and Wi-Fi without waiting for staging buffers to fill. On the Ground Station, tuned the uplink burst timing so the radio enters receive mode immediately after transmission.
+
+### Issue 14: LoRa Bandwidth Bottleneck for Heavy Tasks (Dual-Tier Link Architecture)
+- **What happened:** While 433 MHz LoRa is unbeatable for long-range outdoor telemetry, it operates at a narrow effective data rate (~1.5 to 2.0 KB/s). When attempting heavy ground station operations like downloading the entire ArduPilot parameter list (over 900 parameters) or uploading multi-waypoint autonomous mission plans, LoRa took up to a minute or dropped packets under heavy traffic.
+- **The Engineering Solution:** Implemented a **Dual-Tier Link Architecture**:
+  - *Tier 1 (High-Speed Local Wi-Fi):* Added a native MAVLink UDP bridge on port 14550 directly into the ESP32-CAM Air Unit firmware. When the drone is near the operator (pre-flight bench, pit, launch pad), the operator connects their phone or laptop directly to the ESP32-CAM Wi-Fi hotspot (`BuddyThisAintFreeWifi`). QGroundControl automatically links via UDP port 14550 at Megabits/s bandwidth:
+    - Full parameter downloads complete in 2 to 3 seconds.
+    - Waypoint mission plans upload instantly in a fraction of a second.
+    - Arm/Disarm and Guided commands execute with 0 ms RF latency.
+    - Live FPV video stream (30 FPS MJPEG) runs concurrently on port 81.
+  - *Tier 2 (Long-Range 433 MHz LoRa):* When the drone is flown beyond Wi-Fi range (beyond 50-80 meters), the operator connects QGC to the Ground Station ESP32 via Bluetooth Classic SPP or USB cable. Telemetry continues streaming reliably over LoRa for kilometers.
+  - Both links are active simultaneously in the Air Unit firmware without interfering with each other.
+
+### Issue 15: Battery Voltage Sags, RF Current Spikes & Silent ESP32 Brownout Drops
+- **What happened:** During testing on a low battery, the ESP32-CAM Wi-Fi connection started dropping out repeatedly, forcing manual reconnection on the phone/laptop. Simultaneously, telemetry packets would freeze for 2 to 3 seconds before recovering.
+- **The Root Cause:**
+  - *Combined Peak RF Current Surges:* The ESP32 draws ~80 mA idle. When the Wi-Fi radio transmits frames (especially when QGC links or video frames are pushed), peak current surges to **250–350 mA**. The OV2640 camera sensor consumes **~160 mA** continuously. The LoRa Ra-02 transceiver draws **~100–120 mA** during transmission. Peak surge can exceed **600–700 mA**!
+  - *Battery Internal Resistance & Rail Collapse:* When a 3S LiPo battery is depleted, its internal resistance spikes. Under heavy current draws, the battery voltage sags sharply. If the ESP32-CAM is powered from the flight controller's onboard 5V regulator (which is often rated for only 500 mA to 1A total and shared with the FC MCU and GPS), the 5V rail dips below 4.5V.
+  - *Brownout Detector (BOD) Trip:* The AMS1117-3.3 LDO regulator on the ESP32-CAM requires at least 1.1V to 1.3V of headroom. If the 5V input drops to 4.2V, the 3.3V rail drops below 2.9V. This trips the ESP32 hardware Brownout Detector (`BOD`), causing an instant silent processor reboot. The reboot shuts down the Wi-Fi SoftAP, drops all client associations, wipes volatile serial buffers, and kills the telemetry link until the chip restarts 2 seconds later.
+- **Hardware Solutions & Mitigation:**
+  1. *Decoupling Buffer Capacitor (Critical):* Solder a **470 µF to 1000 µF low-ESR electrolytic capacitor** directly across the `5V` and `GND` pins of the ESP32-CAM, accompanied by a **10 µF or 100 nF ceramic capacitor** across `3.3V` and `GND`. This absorbs transient RF transmit current spikes and prevents the voltage rail from dipping during transmission bursts.
+  2. *Dedicated Switching BEC:* Power the ESP32-CAM and LoRa module from a standalone external 5V 2A–3A switching BEC wired directly to the main power distribution board, rather than drawing current through the flight controller's internal regulator.
+  3. *Minimum Voltage Operating Discipline:* Never conduct RF telemetry bench tests or Wi-Fi video streaming on depleted LiPo packs (below 3.6V per cell / 10.8V on 3S). Recharge batteries prior to radio link tuning.
+
+
