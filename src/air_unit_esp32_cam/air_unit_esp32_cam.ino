@@ -81,6 +81,7 @@ volatile int droneSats = 0;
 volatile float droneSpeed = 0.0;
 volatile unsigned long lastMavlinkTime = 0;
 volatile bool fastFlushRequested = false; // Fast-forward mode changes and emergency alerts over LoRa
+volatile unsigned long lastMissionActivityTime = 0; // Ultra-fast zero-latency passthrough during mission/param transfers
 
 // =================== LIVE DIAGNOSTIC LOG BUFFER ===================
 #define MAX_LOG_LINES 30
@@ -303,9 +304,11 @@ void parseAirMavlinkByte(uint8_t c) {
           uint8_t res = (payloadLen >= 3) ? buf[2] : 255;
           addLog("FC ACK: Msg #77 Cmd %u, Res %u", cmd, res);
         }
-        // 7. Mission negotiation: MISSION_ACK (47), MISSION_REQUEST (40), MISSION_COUNT (44)
-        else if (msgId == 47 || msgId == 40 || msgId == 44) {
-          fastFlushRequested = true; // Fast-forward waypoint mission negotiation
+        // 7. Mission & Parameter negotiation: MISSION_ACK (47), MISSION_REQUEST_INT (51), MISSION_ITEM_INT (73),
+        //    MISSION_REQUEST (40), MISSION_COUNT (44), MISSION_ITEM (39), MISSION_CLEAR_ALL (43), PARAM_VALUE (22)
+        else if (msgId == 47 || msgId == 51 || msgId == 73 || msgId == 40 || msgId == 44 || msgId == 39 || msgId == 43 || msgId == 22) {
+          fastFlushRequested = true; // Fast-forward waypoint mission & parameter negotiation immediately!
+          lastMissionActivityTime = millis();
         }
 
         state = 30;
@@ -399,7 +402,18 @@ void loraBridgeLoop(void * pvParameters) {
   static unsigned long lastAirDiagTime = 0;
   
   for(;;) {
-    // 0. Auto-reconnect if Ra-02 was powered on late or reattached
+    // 0. Auto-Baud Detection: Defaults to 115200 (falls back to 19200 if FC is still at 19200)
+    static uint32_t currentBaud = 115200;
+    static unsigned long lastBaudToggle = 0;
+    if (millis() > 6000 && (millis() - lastMavlinkTime > 3500) && (millis() - lastBaudToggle > 3500)) {
+      lastBaudToggle = millis();
+      currentBaud = (currentBaud == 115200) ? 19200 : 115200;
+      Serial.flush();
+      Serial.begin(currentBaud);
+      addLog("Auto-Baud: Switched to %lu", currentBaud);
+    }
+
+    // Auto-reconnect if Ra-02 was powered on late or reattached
     if (!loraReady) {
       static unsigned long lastRetry = 0;
       if (millis() - lastRetry > 2000) {
@@ -437,7 +451,10 @@ void loraBridgeLoop(void * pvParameters) {
       }
 
       // Transmit telemetry over LoRa (SX1278) for Ground Station
-      if (loraReady) {
+      // CRITICAL OPTIMIZATION: If active mission or parameter upload is underway over Wi-Fi,
+      // DEFER LoRa transmission so safeLoRaSend does NOT block the 40ms Wi-Fi handshake!
+      bool isMissionActive = (millis() - lastMissionActivityTime < 2000);
+      if (loraReady && !isMissionActive) {
         if (safeLoRaSend(stagingBuf, stagingLen)) {
           loraPktCount++;
         }
@@ -445,11 +462,11 @@ void loraBridgeLoop(void * pvParameters) {
 
       stagingLen = 0;
 
-      // 3. Dedicated Uplink Receive Window (75ms)
-      // Grants Ground Station (QGroundControl) clear airtime to send Arm, Takeoff, Mode, Waypoints, & Parameters!
+      // 3. Dedicated Uplink Receive Window (75ms normally, 3ms during active mission uploads)
       unsigned long rxStart = millis();
       unsigned long windowLimit = millis();
-      while ((millis() - rxStart < 75) && (millis() - windowLimit < 160)) {
+      unsigned long rxTarget = isMissionActive ? 3 : 75;
+      while ((millis() - rxStart < rxTarget) && (millis() - windowLimit < 160)) {
         // A. Concurrently read and parse F405 FC UART so ACKs are NEVER delayed!
         while (Serial.available()) {
           uint8_t b = Serial.read();
@@ -461,13 +478,13 @@ void loraBridgeLoop(void * pvParameters) {
           lastStagingTime = millis();
         }
 
-        // B. If F405 answered with COMMAND_ACK (Msg 77) or STATUSTEXT (Msg 253), flush IMMEDIATELY!
+        // B. If F405 answered with COMMAND_ACK (Msg 77), MISSION_REQUEST_INT (Msg 51), etc., flush IMMEDIATELY!
         if (fastFlushRequested && stagingLen > 0) {
-          break; // Break out of receive window immediately to transmit ACK to Ground Station & QGC!
+          break; // Break out of receive window immediately to transmit ACK/Request to QGC!
         }
 
-        // C. Check for incoming uplink packets from Ground Station over LoRa
-        if (loraReady) {
+        // C. Check for incoming uplink packets from Ground Station over LoRa (only when not in mission transfer)
+        if (loraReady && !isMissionActive) {
           int packetSize = LoRa.parsePacket();
           if (packetSize > 0) {
             addLog("LORA RX: %d B uplink -> sent to F405 (R6)", packetSize);
@@ -476,7 +493,6 @@ void loraBridgeLoop(void * pvParameters) {
             }
             rxStart = millis(); // Reset timer to allow chained command packets
           } else if (readLoRaReg(0x18) & 0x08) {
-            // Incoming packet is actively being received over the air -> extend window so it is not cut off!
             rxStart = millis();
           }
         }
@@ -488,13 +504,29 @@ void loraBridgeLoop(void * pvParameters) {
           qgcClientPort = mavUdp.remotePort();
           qgcConnectedViaWifi = true;
           lastQgcUdpPacketTime = millis();
-          addLog("WIFI RX: %d B from QGC -> sent to F405 (R6)", udpRx);
+          uint8_t udpBuf[256];
           while (mavUdp.available()) {
-            Serial.write((uint8_t)mavUdp.read());
+            int len = mavUdp.read(udpBuf, sizeof(udpBuf));
+            if (len > 0) {
+              Serial.write(udpBuf, len);
+              // Detect incoming mission / parameter packets from QGC
+              if (len >= 8 && (udpBuf[0] == 0xFD || udpBuf[0] == 0xFE)) {
+                uint32_t inMsgId = 0;
+                if (udpBuf[0] == 0xFD && len >= 10) {
+                  inMsgId = udpBuf[7] | ((uint32_t)udpBuf[8] << 8) | ((uint32_t)udpBuf[9] << 16);
+                } else if (udpBuf[0] == 0xFE && len >= 6) {
+                  inMsgId = udpBuf[5];
+                }
+                if (inMsgId == 44 || inMsgId == 73 || inMsgId == 39 || inMsgId == 43 || inMsgId == 76 || inMsgId == 21) {
+                  lastMissionActivityTime = millis();
+                  fastFlushRequested = true;
+                }
+              }
+            }
           }
         }
 
-        vTaskDelay(2 / portTICK_PERIOD_MS);
+        vTaskDelay((isMissionActive ? 1 : 2) / portTICK_PERIOD_MS);
       }
     } else {
       // 4. If idle, drain FC Serial and check for incoming LoRa & UDP packets
@@ -522,9 +554,24 @@ void loraBridgeLoop(void * pvParameters) {
         qgcClientPort = mavUdp.remotePort();
         qgcConnectedViaWifi = true;
         lastQgcUdpPacketTime = millis();
-        addLog("WIFI RX: %d B (idle) -> sent to F405 (R6)", udpRx);
+        uint8_t udpBuf[256];
         while (mavUdp.available()) {
-          Serial.write((uint8_t)mavUdp.read());
+          int len = mavUdp.read(udpBuf, sizeof(udpBuf));
+          if (len > 0) {
+            Serial.write(udpBuf, len);
+            if (len >= 8 && (udpBuf[0] == 0xFD || udpBuf[0] == 0xFE)) {
+              uint32_t inMsgId = 0;
+              if (udpBuf[0] == 0xFD && len >= 10) {
+                inMsgId = udpBuf[7] | ((uint32_t)udpBuf[8] << 8) | ((uint32_t)udpBuf[9] << 16);
+              } else if (udpBuf[0] == 0xFE && len >= 6) {
+                inMsgId = udpBuf[5];
+              }
+              if (inMsgId == 44 || inMsgId == 73 || inMsgId == 39 || inMsgId == 43 || inMsgId == 76 || inMsgId == 21) {
+                lastMissionActivityTime = millis();
+                fastFlushRequested = true;
+              }
+            }
+          }
         }
       }
     }
@@ -692,7 +739,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       <div class="badge online" id="udpBadge">MAV UDP :14550</div>
       <a href="/update" class="badge radio" style="text-decoration:none;cursor:pointer;">OTA Flash</a>
       <a href="/logs" target="_blank" class="badge" style="text-decoration:none;cursor:pointer;color:var(--amber);border-color:var(--amber);">Live Logs</a>
-      <div class="badge" style="color:var(--accent);">FW v2.3</div>
+      <div class="badge" style="color:var(--accent);">FW v2.4 (Fast MAV)</div>
       <div class="badge" id="fcBadge">FC: 0 B</div>
       <div class="badge" id="modeBadge">STABILIZE</div>
       <div class="badge" id="batBadge">--.-V (--%)</div>
@@ -1761,9 +1808,9 @@ void startCameraServer() {
 
 // =================== SETUP ===================
 void setup() {
-  // Serial0 connects to F405 FC UART at 19200 baud with 2048-byte RX buffer
+  // Serial0 connects to F405 FC UART at 115200 baud with 2048-byte RX buffer (Auto-baud fallback to 19200)
   Serial.setRxBufferSize(2048);
-  Serial.begin(19200);
+  Serial.begin(115200);
 
   // Initialize Flashlight PWM (GPIO 4)
   initFlash();
@@ -1856,7 +1903,7 @@ void setup() {
 
   // 6. Initialize MAVLink UDP Bridge on standard port 14550 for QGC Wi-Fi Direct Connection
   mavUdp.begin(14550);
-  addLog("Air Unit Booted. FW: v2.3 (MAVLink UDP 14550 + LoRa)");
+  addLog("Air Unit Booted. FW: v2.4 (Fast MAV 115k + UDP :14550)");
 }
 
 void loop() {
