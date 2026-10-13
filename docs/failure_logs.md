@@ -137,9 +137,26 @@ Next up: Calibrating all the ESCs together and starting the tuning process!
   - *Combined Peak RF Current Surges:* The ESP32 draws ~80 mA idle. When the Wi-Fi radio transmits frames (especially when QGC links or video frames are pushed), peak current surges to **250–350 mA**. The OV2640 camera sensor consumes **~160 mA** continuously. The LoRa Ra-02 transceiver draws **~100–120 mA** during transmission. Peak surge can exceed **600–700 mA**!
   - *Battery Internal Resistance & Rail Collapse:* When a 3S LiPo battery is depleted, its internal resistance spikes. Under heavy current draws, the battery voltage sags sharply. If the ESP32-CAM is powered from the flight controller's onboard 5V regulator (which is often rated for only 500 mA to 1A total and shared with the FC MCU and GPS), the 5V rail dips below 4.5V.
   - *Brownout Detector (BOD) Trip:* The AMS1117-3.3 LDO regulator on the ESP32-CAM requires at least 1.1V to 1.3V of headroom. If the 5V input drops to 4.2V, the 3.3V rail drops below 2.9V. This trips the ESP32 hardware Brownout Detector (`BOD`), causing an instant silent processor reboot. The reboot shuts down the Wi-Fi SoftAP, drops all client associations, wipes volatile serial buffers, and kills the telemetry link until the chip restarts 2 seconds later.
-- **Hardware Solutions & Mitigation:**
-  1. *Decoupling Buffer Capacitor (Critical):* Solder a **470 µF to 1000 µF low-ESR electrolytic capacitor** directly across the `5V` and `GND` pins of the ESP32-CAM, accompanied by a **10 µF or 100 nF ceramic capacitor** across `3.3V` and `GND`. This absorbs transient RF transmit current spikes and prevents the voltage rail from dipping during transmission bursts.
-  2. *Dedicated Switching BEC:* Power the ESP32-CAM and LoRa module from a standalone external 5V 2A–3A switching BEC wired directly to the main power distribution board, rather than drawing current through the flight controller's internal regulator.
-  3. *Minimum Voltage Operating Discipline:* Never conduct RF telemetry bench tests or Wi-Fi video streaming on depleted LiPo packs (below 3.6V per cell / 10.8V on 3S). Recharge batteries prior to radio link tuning.
+- **The Solution (APM Power Module Integration - CONFIRMED FLAWLESS):**
+  - Instead of adding an external standalone regulator or rewiring the PDB, re-purposed the existing inline **APM Power Module** connected to the 3S LiPo battery.
+  - The APM Power Module contains an onboard heavy-duty step-down switching regulator that outputs **+5.3V at up to 2.5A continuous current**.
+  - Connected Pin 1 (+5.3V red wire) directly to the ESP32-CAM `5V` pin, and Pin 5/6 (GND) to the common ground.
+  - Completely disconnected the +5V red wire from the F405 flight controller to prevent regulator back-feeding.
+  - **Result:** The ESP32-CAM and LoRa module now receive isolated, high-current switching power. Wi-Fi streaming, high-speed MAVLink UDP, and LoRa telemetry now run rock-solid with zero brownouts or disconnects, even as battery voltage decreases.
+
+### Issue 16: High-Throttle Voltage Sags Triggering Premature ArduPilot Failsafes
+- **What happened:** During rapid throttle punchouts and aggressive flight maneuvers, four 1000KV motors with 1045 propellers pull 50A to 70A. The battery voltage naturally sags by 1.0V to 1.5V momentarily due to internal cell resistance. Because ArduPilot's battery monitor was reading raw voltage directly from the noisy PDB without an adequate confirmation delay, brief 1-second throttle bursts dropped the voltage below the low-voltage limit, immediately triggering an unwanted low-battery Land failsafe while the pack still had over 50% capacity!
+- **The Root Cause:**
+  - `BATT_LOW_TIMER` was set to default (0 or low seconds), causing instantaneous failsafe triggers on transient dips.
+  - `BATT_LOW_VOLT` was set too high (e.g. 10.5V - 10.8V), leaving zero headroom for natural motor-induced voltage sags.
+- **The Parameter Fix (Applied & Verified in ArduPilot):**
+  - `BATT_LOW_TIMER = 10` (Introduced a 10-second confirmation window. ArduPilot now requires voltage to remain continuously low for 10 full seconds before executing a failsafe, completely filtering out transient 1-3 second throttle dips).
+  - `BATT_LOW_VOLT = 10.2` (Configured realistic under-load threshold: 3.40V per cell under load; resting voltage returns to safe ~11.0V).
+  - `BATT_CRT_VOLT = 9.9` (Set critical threshold: 3.30V per cell under load; resting voltage returns to ~10.5V).
+  - `BATT_ARM_VOLT = 11.1` (Prevents arming on a discharged pack: 3.70V per cell).
+  - `BATT_FS_LOW_ACT = 1` (Action on confirmed low battery: Land on the spot).
+  - `BATT_FS_CRT_ACT = 1` (Action on critical battery: Land immediately).
+- **Result:** Rapid throttle punchouts and high-current flight maneuvers no longer trigger false alarms or premature landings. The failsafe only activates when the battery is genuinely depleted.
+
 
 

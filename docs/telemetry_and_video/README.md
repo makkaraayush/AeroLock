@@ -50,7 +50,7 @@ Here is the complete walkthrough of how I designed it, how I'm wiring everything
 * 1x AI-Thinker ESP32-CAM (with OV2640 camera module)
 * 1x LoRa Ra-02 (SX1278 433 MHz) transceiver module
 * 1x 16.4 cm solid copper wire (quarter-wave antenna cut to 164 mm)
-* 5V power from the DakeFPV F405 flight controller BEC
+* Dedicated +5.3V 2.5A switching power from the inline APM Power Module (completely isolated from the FC 5V rail)
 
 ### Ground Station (Mounted on FlySky FS-i6 Radio)
 * 1x Standard ESP32 Development Board (ESP-WROOM-32 / 30-pin or 38-pin DevKit v1)
@@ -247,13 +247,13 @@ Here is how all the modules on the FlySky transmitter connect to the ESP32 DevKi
 
 On the drone, the AI-Thinker ESP32-CAM uses its dual-core processor to handle MAVLink bridging on Core 0 and live Wi-Fi video streaming on Core 1.
 
-### A. DakeFPV F405 to ESP32-CAM
-| F405 FC Pad | ESP32-CAM Pin | Purpose |
+### A. DakeFPV F405 and APM Power Module to ESP32-CAM
+| Power / FC Signal | ESP32-CAM Pin | Purpose / Details |
 | :--- | :--- | :--- |
-| **5V** (BEC pad) | **5V** | Powers the ESP32-CAM, camera, and Ra-02 |
-| **GND** | **GND** | Common ground reference |
-| **T6** (UART6 TX) | **U0R** (GPIO 3) | F405 sends MAVLink telemetry to ESP32 |
-| **R6** (UART6 RX) | **U0T** (GPIO 1) | ESP32 sends waypoint commands to F405 |
+| **APM Module VCC (+5.3V)** | **5V** | High-current 2.5A switching BEC (FC 5V pad is DISCONNECTED!) |
+| **APM Module & FC GND** | **GND** | Common ground reference tied between APM module, FC, and ESP32 |
+| **T6** (F405 UART6 TX) | **U0R** (GPIO 3) | F405 sends MAVLink telemetry to ESP32-CAM |
+| **R6** (F405 UART6 RX) | **U0T** (GPIO 1) | ESP32-CAM forwards QGC commands to F405 |
 
 ### B. ESP32-CAM to Air LoRa Ra-02 (SPI on Header 1)
 To allow a flat, uncrossed 4-conductor ribbon cable from the Ra-02 SPI lines (`SCK, MISO, MOSI, NSS`), the pins are mapped in exact sequential physical order on Header 1 (Left header, Front View):

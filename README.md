@@ -15,7 +15,7 @@ The repository documents the complete engineering progression: hardware assembly
 | **Firmware** | ArduCopter V4.7.1 Custom Build | ChibiOS RTOS; migrated from Betaflight |
 | **RC Radio Link** | FlySky FS-i6 Transmitter + FS-iA6B Receiver | i-BUS serial protocol on UART2 (115200 baud); 5-mode mixer |
 | **Motors & ESCs** | 4x 1000KV sensorless brushless motors | 4x 30A analog ESCs running 480Hz legacy PWM |
-| **Power System** | 3S 2200mAh 35C LiPo battery | XT60 harness, integrated PDB, phone reverse-charge boot sequence |
+| **Power System** | 3S 2200mAh 35C LiPo battery | XT60 harness, integrated PDB, APM Power Module (+5.3V 2.5A switching BEC for ESP32-CAM) |
 | **Navigation** | M10Q 250 GPS + QMC5883L Magnetometer | Elevated folding mast mount; I2C compass on external bus |
 | **Air Telemetry Unit** | AI-Thinker ESP32-CAM + Ra-02 (SX1278 433 MHz) | UART6 MAVLink bridge; dual-core RTOS; dual-band RF |
 | **Ground Station** | ESP32 DevKit v1 + Ra-02 + 0.96" SSD1306 OLED | Bluetooth Classic SPP to phone; USB COM to PC; 1S 520mAh LiPo |
@@ -73,7 +73,8 @@ Every unexpected failure, glitch, and hardware issue encountered across the buil
 | **12** | Telemetry UART dropouts & silence | Misconfigured ArduPilot serial parameters & stream rates | Configured `SERIAL6_PROTOCOL = 2`, `BAUD = 19`, and enabled SR6 stream rates. |
 | **13** | QGC command timeouts & mode lag | Half-duplex LoRa collisions & heartbeat delay | Instant mode extraction via `STATUSTEXT` (Msg 253) & immediate ACK fast-flush. |
 | **14** | LoRa bandwidth bottleneck for missions | LoRa 19200 baud too slow for 900+ parameters / missions | Built dual-tier architecture: high-speed Wi-Fi UDP :14550 + long-range LoRa. |
-| **15** | Battery sags & silent ESP32 brownouts | Low battery resistance + 700mA peak RF spikes tripped BOD | Added 1000µF decoupling capacitor, dedicated BEC, and low-voltage cutoff. |
+| **15** | Battery sags & silent ESP32 brownouts | Low battery resistance + 700mA peak RF spikes tripped BOD | Spliced APM Power Module dedicated 5.3V 2.5A switching BEC directly to ESP32-CAM (isolated from FC). |
+| **16** | Premature failsafe on motor punchouts | 60A motor loads caused temporary 1.5V voltage sag | Configured `BATT_LOW_TIMER = 10`, `BATT_LOW_VOLT = 10.2V`, and `BATT_FS = Land`. |
 
 ---
 
@@ -140,10 +141,15 @@ When operating on a depleted 3S LiPo battery, the battery's internal resistance 
 
 Because the ESP32-CAM's onboard AMS1117-3.3 linear regulator requires 1.1V to 1.3V of headroom, a drop on the 5V rail pulls the 3.3V rail down to 2.8V. This triggers the ESP32 hardware **Brownout Detector (BOD)**, causing a silent chip reset that drops Wi-Fi client associations and interrupts telemetry.
 
-### Physical Mitigation Steps
-1. **Low-ESR Decoupling Capacitor:** Solder a 470 µF to 1000 µF low-ESR electrolytic capacitor directly across the `5V` and `GND` pins of the ESP32-CAM. Solder a 100 nF ceramic capacitor across `3.3V` and `GND`. This reservoir provides instantaneous current during RF bursts, eliminating rail sag.
-2. **Dedicated 5V Switching BEC:** Power the ESP32-CAM and LoRa module from a dedicated 5V 2A–3A switching BEC wired directly to the main power distribution board, rather than drawing current through the flight controller's sensor BEC.
-3. **Low-Voltage Cutoff Discipline:** Discontinue high-power RF bench testing when pack voltage falls below 3.6V per cell (10.8V on a 3S pack).
+### The Solution: APM Power Module Isolation & Sag Filtering (Verified Flawless)
+1. **Isolated Heavy-Duty 5.3V Switching BEC:**
+   - Powered the ESP32-CAM and LoRa module directly from the inline **APM Power Module's 5.3V 2.5A switching regulator** (Pin 1/2 VCC and Pin 5/6 GND).
+   - Completely disconnected the +5V red wire from the flight controller to prevent regulator back-feeding.
+   - The 5.3V rail provides 2.0V of headroom above the ESP32-CAM's onboard AMS1117-3.3 dropout limit, completely eliminating brownouts even under peak Wi-Fi/LoRa RF load.
+2. **ArduPilot Battery Sag Filtering:**
+   - Configured `BATT_LOW_TIMER = 10` (ArduPilot ignores transient 1–4 second throttle sags, requiring 10 continuous seconds of low voltage before triggering failsafe).
+   - Set under-load thresholds: `BATT_LOW_VOLT = 10.2V` (3.40V/cell) and `BATT_CRT_VOLT = 9.9V` (3.30V/cell).
+   - Set pre-arm threshold `BATT_ARM_VOLT = 11.1V` and failsafe action to Land (`BATT_FS_LOW_ACT = 1`).
 
 ---
 

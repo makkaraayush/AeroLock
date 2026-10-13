@@ -282,6 +282,23 @@ Following the successful indoor tests, took the quad outside to test autonomous 
    - **RTL Altitude Raised to 22m (`RTL_ALT = 2200`):** For deliberate, switch-commanded RTL returns, the cruising altitude was increased to 22 meters (2200cm) to guarantee total clearance over the tallest neighborhood tree canopy (~18-20m), permanently resolving the tree snag hazard.
    - Replaced broken 1045 prop; battery recharged and all sensor telemetry verified healthy in Mission Planner. Ready for next flight phase.
 
+---
+
+### Oct 13, 2026: Dual-Tier Telemetry, APM Power Module Integration & ArduPilot Sag Tuning
+- **Dual-Tier Link Architecture Deployed:**
+  - Integrated high-speed MAVLink UDP bridge on port 14550 directly into the ESP32-CAM Air Unit firmware alongside the long-range 433 MHz LoRa link.
+  - Verified instant parameter tree download (2 seconds) and sub-second autonomous mission uploads from QGroundControl via Wi-Fi (`BuddyThisAintFreeWifi`).
+  - Flight mode transitions now update on OLED and Cockpit HUD in under 20 ms via direct `STATUSTEXT` (Msg #253) decoding.
+- **Power Brownout Diagnostics & APM Module Solution (CONFIRMED FLAWLESS):**
+  - Diagnosed intermittent Wi-Fi drops on low battery: combined peak current draw (Wi-Fi 350mA + Camera 160mA + LoRa 110mA = ~700mA surge) caused voltage sags that tripped the ESP32 Brownout Detector (`BOD`).
+  - Spliced power from the existing inline **APM Power Module**: connected its dedicated **+5.3V 2.5A switching BEC** output directly to the ESP32-CAM `5V` pin and tied ground with the flight controller. Disconnected the F405 +5V pad to prevent back-feeding.
+  - *Result:* Completely eliminated brownouts. Wi-Fi, camera stream, and LoRa telemetry remain rock-solid even under heavy current draws and low battery voltages.
+- **ArduPilot Battery Sag Parameter Tuning:**
+  - Configured `BATT_LOW_TIMER = 10` to ignore transient 1-4 second voltage sags during motor throttle punchouts.
+  - Set realistic 3S under-load thresholds: `BATT_LOW_VOLT = 10.2V` (3.40V/cell) and `BATT_CRT_VOLT = 9.9V` (3.30V/cell).
+  - Set pre-arm threshold `BATT_ARM_VOLT = 11.1V` and configured failsafe action to Land (`BATT_FS_LOW_ACT = 1`).
+  - *Status:* Verified flawless operation on bench and live links. Zero premature failsafes, zero telemetry disconnects.
+
 
 
 
