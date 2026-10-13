@@ -668,12 +668,14 @@ void loop() {
     }
   }
 
-  // 2. Receive commands from Phone (BT) OR PC (USB Serial) -> Forward to Drone over LoRa
+  // 2. Receive commands & waypoint missions from Phone (BT) OR PC (USB Serial) -> Forward to Drone over LoRa
   if (SerialBT.available() || Serial.available()) {
     uint8_t buffer[160];
     int count = 0;
     unsigned long startRead = millis();
-    while ((millis() - startRead < 12) && count < sizeof(buffer)) {
+    int expectedLen = 0;
+
+    while ((millis() - startRead < 10) && count < sizeof(buffer)) {
       if (SerialBT.available()) {
         buffer[count++] = SerialBT.read();
         startRead = millis();
@@ -682,6 +684,18 @@ void loop() {
         startRead = millis();
       } else {
         delay(1);
+      }
+
+      // Fast frame completion detector: Once a complete MAVLink packet arrives, forward immediately!
+      if (expectedLen == 0) {
+        if (buffer[0] == 0xFD && count >= 3) {
+          expectedLen = 12 + buffer[1] + ((buffer[2] & 0x01) ? 13 : 0); // MAVLink 2
+        } else if (buffer[0] == 0xFE && count >= 2) {
+          expectedLen = 8 + buffer[1]; // MAVLink 1
+        }
+      }
+      if (expectedLen > 0 && count >= expectedLen) {
+        break; // Full packet received; dispatch over LoRa immediately without waiting!
       }
     }
     if (count > 0) {

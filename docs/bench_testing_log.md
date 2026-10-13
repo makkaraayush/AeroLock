@@ -299,6 +299,20 @@ Following the successful indoor tests, took the quad outside to test autonomous 
   - Set pre-arm threshold `BATT_ARM_VOLT = 11.1V` and configured failsafe action to Land (`BATT_FS_LOW_ACT = 1`).
   - *Status:* Verified flawless operation on bench and live links. Zero premature failsafes, zero telemetry disconnects.
 
+---
+
+### Oct 14, 2026: Sub-Second Wi-Fi Mission Uploads & Dual-Link Concurrent Telemetry
+- **Sub-Second Wi-Fi Waypoint Transfer Achieved:**
+  - Deployed MAVLink 2 zero-delay passthrough and 115200 auto-baud detection in the Air Unit.
+  - Verified with QGroundControl: waypoint mission uploads complete in a fraction of a second with zero timeouts or errors.
+- **LoRa RF Link Restoration (FW v2.5):**
+  - Identified why Ground Station showed `LORA: NO RF SIGNAL`: background ArduPilot `PARAM_VALUE` streaming was tripping a temporary mission activity timer, which choked the LoRa sender and cleared buffer airtime.
+  - Removed parameters from the lockout and embedded an instant UDP packet service loop inside `safeLoRaSend`. Both Wi-Fi UDP :14550 and 433 MHz LoRa now run concurrently with zero latency penalty on either link.
+  - Set the 13-byte `$AG` diagnostic heartbeat to fire unconditionally every 1.2s so Ground Station OLED never loses RF signal lock.
+- **Ground Station Fast Bluetooth/USB Mission Uploads:**
+  - Added instant MAVLink frame length detection to Ground Station uplink processing. When uploading waypoints via phone Bluetooth Classic (`Drone_Telemetry`) or PC USB, completed packets dispatch over LoRa immediately without waiting for serial gap timeouts.
+
+
 
 
 

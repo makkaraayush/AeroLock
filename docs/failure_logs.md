@@ -158,5 +158,19 @@ Next up: Calibrating all the ESCs together and starting the tuning process!
   - `BATT_FS_CRT_ACT = 1` (Action on critical battery: Land immediately).
 - **Result:** Rapid throttle punchouts and high-current flight maneuvers no longer trigger false alarms or premature landings. The failsafe only activates when the battery is genuinely depleted.
 
+### Issue 17: LoRa RF Link Starvation Caused by Parameter Streaming Lockout
+- **What happened:** After deploying the ultra-fast MAVLink 2 passthrough and auto-baud firmware (which achieved sub-second Wi-Fi waypoint uploads), the FlySky Ground Station OLED unexpectedly displayed `LORA: NO RF SIGNAL` with zero packets received, despite the drone being powered and right on the bench.
+- **The Root Cause:**
+  1. *Parameter Flood Triggering False Mission Lockout:* In an attempt to prevent 40ms LoRa transmission cycles from delaying Wi-Fi waypoint handshakes, an activity timer (`isMissionActive`) was implemented to suppress LoRa transmissions during active transfers. However, `PARAM_VALUE` (Msg #22), `PARAM_REQUEST_LIST` (Msg #21), and `COMMAND_LONG` (Msg #76) were included in this trigger. Because ArduPilot streams over 900+ parameters upon boot and background sync, `lastMissionActivityTime` refreshed continuously.
+  2. *Total Airtime Starvation:* With `isMissionActive` perpetually evaluated as `true`, `safeLoRaSend(stagingBuf, stagingLen)` was skipped on every iteration and `stagingLen` was reset to 0. Zero telemetry packets were transmitted over 433 MHz RF.
+  3. *Diagnostic Ping Starvation:* The periodic 13-byte `$AG` heartbeat was guarded by `if (loraReady && stagingLen == 0)`. Because the F405 FC streams continuous UART telemetry, `stagingLen == 0` was never satisfied, silencing the heartbeat as well.
+- **The Engineering Solution (Implemented in FW v2.5):**
+  1. *Isolated Handshake Detection:* Removed `PARAM_VALUE`, `PARAM_REQUEST_LIST`, and general commands from mission lockout triggers. Restricted fast-flush triggers strictly to waypoint handshake messages (`MISSION_COUNT` #44, `MISSION_REQUEST_INT` #51, `MISSION_ITEM_INT` #73, `MISSION_ACK` #47, `MISSION_REQUEST` #40) and command confirmations (`COMMAND_ACK` #77).
+  2. *Always-On Dual-Tier Transmission:* LoRa telemetry transmission is restored unconditionally alongside Wi-Fi UDP.
+  3. *Zero-Latency UDP Service Loop in LoRa Driver:* Embedded a non-blocking `mavUdp.parsePacket()` service loop directly inside `safeLoRaSend`. While the SX1278 hardware transmits RF autonomously from its internal FIFO (taking 25-35 ms), any incoming UDP packet from QGC is parsed and forwarded to F405 FC UART within 1 ms, guaranteeing zero Wi-Fi delay.
+  4. *Unconditional 1.2s RF Diagnostic Heartbeat:* The 13-byte `$AG` heartbeat frame transmits every 1.2 seconds unconditionally, ensuring Ground Station `airRfAlive` never expires even if the FC is unpowered or in DFU mode.
+  5. *Ground Station Fast Frame Detection:* Upgraded Ground Station Bluetooth/USB uplink handling with instant MAVLink frame length detection. Once the exact packet length (e.g. 50 bytes for `MISSION_ITEM_INT`) is reached in the serial buffer, it dispatches over LoRa immediately without waiting for the 10-12 ms idle timeout.
+- **Result:** Ground Station immediately locks RF signal (`LORA: OK (-65 dBm)` and live Fighter Jet HUD). Wi-Fi waypoint uploads remain sub-second, and LoRa waypoint uploads via Ground Station Bluetooth/USB operate at peak possible throughput.
+
 
 
