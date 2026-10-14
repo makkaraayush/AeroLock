@@ -111,29 +111,45 @@ static void writeLoRaReg(uint8_t addr, uint8_t val) {
 }
 
 void recoverLoRaRadio() {
+  LoRa.end();
+  SPI.end();
+
   if (LORA_RST != -1) {
     pinMode(LORA_RST, OUTPUT);
     digitalWrite(LORA_RST, LOW);
-    delay(10);
+    delay(15);
     digitalWrite(LORA_RST, HIGH);
-    delay(10);
+    delay(15);
   }
+
+  pinMode(LORA_SS, OUTPUT);
+  digitalWrite(LORA_SS, HIGH);
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
   if (LoRa.begin(433E6)) {
     LoRa.setSpreadingFactor(7);
     LoRa.setSignalBandwidth(250E3);
     LoRa.setCodingRate4(5);
     LoRa.setSyncWord(0x12);
-    LoRa.setTxPower(17);
+    LoRa.setTxPower(14); // Matching +14dBm (25mW)
     LoRa.setOCP(100);
+    LoRa.parsePacket();
   }
 }
 
-bool safeLoRaSend(const uint8_t* data, size_t len, uint32_t timeoutMs = 120) {
+bool safeLoRaSend(const uint8_t* data, size_t len, uint32_t timeoutMs = 80) {
   if (len == 0) return false;
 
   if (!LoRa.beginPacket()) {
-    recoverLoRaRadio();
-    return false;
+    uint8_t flags = readLoRaReg(0x12);
+    if (flags & 0x08) {
+      writeLoRaReg(0x12, 0x08);
+    }
+    if (!LoRa.beginPacket()) {
+      return false; // Radio busy transmitting, skip frame safely
+    }
   }
   LoRa.write(data, len);
   LoRa.endPacket(true);
@@ -629,7 +645,7 @@ void setup() {
   LoRa.setSignalBandwidth(250E3);        // 250 kHz bandwidth
   LoRa.setCodingRate4(5);               // 4/5 coding rate
   LoRa.setSyncWord(0x12);                // Private drone sync word
-  LoRa.setTxPower(17);                   // +17dBm (50mW) output power
+  LoRa.setTxPower(14);                   // +14dBm (25mW) output power
   LoRa.setOCP(100);                      // 100mA overcurrent limit
 
   updateStationBattery();
