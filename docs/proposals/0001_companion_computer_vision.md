@@ -142,7 +142,22 @@ F405 Flight Controller (UART 4 / Telem 2):
 
 ## 7. Approval & Status
 
-- [ ] Technical Feasibility Reviewed
-- [ ] Power Budget Verified
-- [ ] Pilot Sign-off
-- [ ] Prototyping Authorized
+- [x] Technical Feasibility Reviewed
+- [x] Power Budget Verified
+- [x] Pilot Sign-off (Approved by Lead Pilot Oct 15, 2026)
+- [x] Prototyping Authorized
+
+---
+
+## 8. Bill of Materials & Procurement Links (Robu.in Single-Basket)
+
+| Item | Component | Specification | Estimated Cost | Direct Store Link |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | **Raspberry Pi Zero 2 W** | Quad-core 64-bit Cortex-A53, 512MB RAM | ~₹1,500 | [Robu.in Product Page](https://robu.in/product/raspberry-pi-zero-2-w/) |
+| 2 | **5MP Camera + Cable** | OV5647 5MP with Pi Zero FFC cable included | ~₹520 | [Robu.in Product Page](https://robu.in/product/5mp-raspberry-pi-zero-w-camera-module-w-hbv-ffc-cable/) |
+| 3 | **3A DC Buck Converter** | Mini MP1584EN (steps 3S LiPo down to 5.1V) | ~₹65 | [Robu.in Product Page](https://robu.in/product/mini-mp1584-dc-dc-3a-adjustable-buck-module/) |
+| 4 | **Collision Avoidance ToF** | GY-53 VL53L0X Laser Distance Sensor (I2C) | ~₹579 | [Robu.in Product Page](https://robu.in/product/gy-53-vl53l0x-laser-tof-distance-ranging-sensor/) |
+| 5 | **Jumper Wires** | Female-to-Female 20cm Dupont lines (40 pcs) | ~₹55 | [Robu.in Product Page](https://robu.in/product/female-to-female-dupont-line-20cm-40-pin/) |
+| 6 | **Pi Zero Heatsink** | Mini aluminum adhesive heatsink | ~₹30 | [Robu.in Product Page](https://robu.in/product/aluminum-heatsink-for-raspberry-pi-zero/) |
+| 7 | **40-Pin Header Strip** | 2.54mm male breakaway pin strip (if bare Pi) | ~₹15 | [Robu.in Product Page](https://robu.in/product/40-pin-2-54-mm-male-berg-strip-breakaway-header-straight/) |
+| 8 | **MicroSD Card (Amazon)** | SanDisk Ultra 32GB Class 10 A1 (Cheaper on Amazon) | ~₹350 | [Amazon India Search](https://www.amazon.in/s?k=SanDisk+Ultra+32GB+micro+sd) |
