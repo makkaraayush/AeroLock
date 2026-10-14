@@ -29,8 +29,8 @@ Every idea follows a structured lifecycle to ensure hardware safety, electrical 
 
 | ID | Title | Category | Target Hardware | Status | Document |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **RFC-001** | Raspberry Pi Companion Computer & Edge AI Engine | Autonomy / Vision | Pi Zero 2W / Pi 4B + Camera | **`UNDER REVIEW`** | [RFC-001 Document](0001_companion_computer_vision.md) |
-| **RFC-002** | DroneBridge & ESP-NOW vs. 433 MHz LoRa Evaluation | RF / Telemetry | ESP32-CAM + Ra-02 | **`UNDER REVIEW`** | [RFC-002 Document](0002_esp_now_vs_lora_analysis.md) |
+| **RFC-001** | Raspberry Pi Companion Computer & Edge AI Engine | Autonomy / Vision | Pi Zero 2W / Pi 4B + Camera | **`APPROVED`** | [RFC-001 Document](0001_companion_computer_vision.md) |
+| **RFC-002** | DroneBridge & ESP-NOW vs. 433 MHz LoRa Evaluation | RF / Telemetry | ESP32-CAM + Ra-02 | **`DEFERRED`** | [RFC-002 Document](0002_esp_now_vs_lora_analysis.md) |
 | **RFC-003** | Advanced Autonomy & Sensor Fusion Roadmap | Expansion / Sensors | LiDAR, Optical Flow, 4G LTE | **`IDEA`** | [RFC-003 Document](0003_advanced_autonomy_roadmap.md) |
 
 ---

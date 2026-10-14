@@ -1,9 +1,10 @@
 # RFC-001: Raspberry Pi Companion Computer & Edge AI Engine
 
-**Status:** `UNDER REVIEW`  
+**Status:** `APPROVED`  
 **Category:** Autonomy / Computer Vision  
 **Author:** Lead Engineer & Antigravity  
 **Created:** Oct 15, 2026  
+**Approved:** Oct 15, 2026  
 
 ---
 

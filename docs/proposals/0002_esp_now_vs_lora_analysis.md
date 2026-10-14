@@ -1,6 +1,6 @@
 # RFC-002: DroneBridge & ESP-NOW vs. 433 MHz LoRa Telemetry Evaluation
 
-**Status:** `UNDER REVIEW`  
+**Status:** `DEFERRED` (Retained 433 MHz LoRa & Wi-Fi UDP architecture)  
 **Category:** RF & Communications Architecture  
 **Author:** Lead Engineer & Antigravity  
 **Created:** Oct 15, 2026  
