@@ -312,9 +312,14 @@ Following the successful indoor tests, took the quad outside to test autonomous 
 - **Ground Station Fast Bluetooth/USB Mission Uploads:**
   - Added instant MAVLink frame length detection to Ground Station uplink processing. When uploading waypoints via phone Bluetooth Classic (`Drone_Telemetry`) or PC USB, completed packets dispatch over LoRa immediately without waiting for serial gap timeouts.
 
+---
 
-
-
-
-
+### Oct 27, 2026: 3D Printing Milestone & Custom Prop Guards Integration
+- **Rapid Prototyping Infrastructure Online:**
+  - Acquired a dedicated 3D printer after 4 years of planning, saving, and persistence.
+  - The AeroLock testbed is now fully self-sufficient for rapid on-demand mechanical enclosures, aerodynamic brackets, and sensor mounts without relying on external fabrication.
+- **3D Printed Prop Guards Installed:**
+  - Installed 4x custom 3D printed prop guards protecting the 1045 propellers.
+  - Provides a critical physical safety buffer for future companion computer vision experiments, indoor bench hover tests, and close-quarters autonomous maneuvering.
+  - Verified blade tip clearance to ensure zero contact during high-throttle propeller deflection.
 
