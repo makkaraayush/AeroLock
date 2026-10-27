@@ -1,4 +1,4 @@
-# 500mm Quadcopter Commutation Testbed & Dual-Tier Telemetry System
+# AeroLock: 500mm Autonomous Quadcopter & Dual-Tier Telemetry Platform
 
 > *"This was once an abandoned project. I tried everything I could, hit wall after wall, and no matter what I did, it refused to work right. So I gave up on it. But later, I made a personal vow: I will not start a single new project until I return to this machine, fix every root-cause flaw, and make this drone fly rock-solid and super stable."*
 
@@ -41,7 +41,7 @@ Today, this repository is the complete blueprint of that comeback: an autonomous
 ## 2. Repository Structure
 
 ```
-quad-commutation-testbed/
+AeroLock/
 ├── README.md                           # Main engineering overview & build log
 ├── .gitignore                          # Build artifacts and firmware binary ignore rules
 ├── firmware/                           # Flight controller firmware targets
