@@ -1,8 +1,24 @@
 # 500mm Quadcopter Commutation Testbed & Dual-Tier Telemetry System
 
-A custom 500mm quadcopter engineering platform and diagnostic testbed. Originally conceived on legacy 8-bit APM hardware, the project was migrated to a 32-bit STM32F405 flight controller running ArduCopter to investigate low-level motor commutation, analog ESC timing characteristics, and custom long-range telemetry links without the expense of commercial ground equipment.
+> *"This was once an abandoned project. I tried everything I could, hit wall after wall, and no matter what I did, it refused to work right. So I gave up on it. But later, I made a personal vow: I will not start a single new project until I return to this machine, fix every root-cause flaw, and make this drone fly rock-solid and super stable."*
 
-The repository documents the complete engineering progression: hardware assembly, Betaflight commutation profiling, ArduPilot migration, sensor bus diagnostics, autonomous flight testing, crash recovery, and the creation of an ultra-low-cost ($15) Dual-Tier Telemetry and Live Video streaming architecture using ESP32 microcontrollers and LoRa radios.
+---
+
+## The Origin: From Shelved Failure to Flawless Stability
+
+Every drone builder knows the frustration of an aircraft that simply refuses to cooperate. This project started with blown ESC MOSFETs, motor commutation stuttering, timer collisions, intermittent brownouts, and violent bench crashes that destroyed carbon-reinforced propellers. It culminated in an uncontrolled fly-away and tree snag that felt like the absolute end of the road. 
+
+Exhausted by endless debugging and unexplainable hardware failures, the project was shelved and declared dead.
+
+Months later came the turning point: a firm resolution to never leave an engineering puzzle unsolved. Rather than moving on to shiny new ideas, the mandate was set: **zero new projects until this quad flies with total, unwavering stability.**
+
+Every subsystem was torn down to first principles:
+- **Commutation & Timing:** Replaced conflicting DSHOT protocols with legacy 480Hz analog PWM timing to match the analog ESC gate drivers.
+- **Electrical Isolation:** Rebuilt the power distribution, banishing ground loops and powering the ESP32 RF section from a dedicated 5.3V 2.5A switching regulator to kill 700mA transient brownouts permanently.
+- **Flight Controller Core:** Migrated to ArduCopter on an STM32F405 with custom EKF3 sensor fusion, notch filtering, and elevated mast compass isolation.
+- **Affordable Custom Telemetry:** Replaced expensive commercial RF systems with an ultra-low-cost ($15) Dual-Tier ESP32 Wi-Fi + 433 MHz LoRa architecture with a custom Fighter Jet HUD on the FlySky transmitter.
+
+Today, this repository is the complete blueprint of that comeback: an autonomous 500mm quadcopter that holds rock-solid hovers in wind, uploads missions in sub-second bursts, and streams real-time telemetry over kilometers.
 
 ---
 
